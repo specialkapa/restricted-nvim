@@ -14,6 +14,7 @@ require 'core.lsp' -- FileType python -> vim.lsp.start
 require 'core.pyformat' -- BufWritePost *.py -> ruff on modified hunks
 require 'core.terminal' -- <leader>tt, TermOpen mappings
 require 'core.picker' -- <leader>sf / sg / sw / sb / /
+require 'core.gitblame' -- <leader>gb
 
 -- PYTHONBREAKPOINT lives here rather than in pydebug so `breakpoint()` still routes to
 -- the debugger in a session where you never open a .py buffer.

@@ -534,6 +534,12 @@ function M.buffer_lines()
   }
 end
 
+-- Exported so other modules can build their own pickers on the same widget rather than
+-- falling back to vim.ui.select, which without a plugin is a numbered command-line
+-- prompt. See browse_breakpoints in core/pydebug.lua.
+M.pick = pick
+M.file_preview = file_preview
+
 vim.keymap.set('n', '<leader>sf', M.files, { desc = '[S]earch [F]iles' })
 vim.keymap.set('n', '<leader>sg', M.grep, { desc = '[S]earch by [G]rep' })
 vim.keymap.set({ 'n', 'x' }, '<leader>sw', M.grep_word, { desc = '[S]earch current [W]ord' })

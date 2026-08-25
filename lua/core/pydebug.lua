@@ -141,29 +141,44 @@ local function clear_breakpoints()
 	vim.notify(("removed %d breakpoint(s)"):format(removed), vim.log.levels.INFO)
 end
 
+---Browse breakpoints in the same picker widget the file/grep pickers use, so you get
+---fuzzy filtering and a preview of the line each breakpoint actually sits on.
 local function browse_breakpoints()
-	local items = {}
-	for _, line in ipairs(read_lines()) do
-		local file, lnum, cond = parse(line)
-		if file then
-			items[#items + 1] = { file = file, lnum = lnum, cond = cond }
-		end
-	end
-	if #items == 0 then
-		vim.notify("no breakpoints set", vim.log.levels.INFO)
-		return
-	end
-	vim.ui.select(items, {
-		prompt = "Breakpoints",
-		format_item = function(i)
-			return ("%s:%d%s"):format(i.file, i.lnum, i.cond and ("  [" .. i.cond .. "]") or "")
-		end,
-	}, function(choice)
-		if choice then
-			vim.cmd.edit(vim.fs.normalize(root() .. "/" .. choice.file))
-			vim.api.nvim_win_set_cursor(0, { choice.lnum, 0 })
-		end
-	end)
+  local items = {}
+  for _, line in ipairs(read_lines()) do
+    local file, lnum, cond = parse(line)
+    if file then
+      items[#items + 1] = { file = file, lnum = lnum, cond = cond }
+    end
+  end
+  if #items == 0 then
+    vim.notify('no breakpoints set', vim.log.levels.INFO)
+    return
+  end
+
+  local picker = require 'core.picker'
+  local dir = root()
+
+  local function abs(item)
+    return vim.fs.normalize(dir .. '/' .. item.file)
+  end
+
+  picker.pick {
+    prompt = 'Breakpoints',
+    items = items,
+    format = function(i)
+      return ('%s:%d%s'):format(i.file, i.lnum, i.cond and ('  [' .. i.cond .. ']') or '')
+    end,
+    preview = function(i)
+      return picker.file_preview(abs(i), i.lnum)
+    end,
+    -- Same <CR>/<C-t>/<C-v>/<C-x> verbs as every other picker.
+    on_choice = function(i, action)
+      vim.cmd[action](vim.fn.fnameescape(abs(i)))
+      pcall(vim.api.nvim_win_set_cursor, 0, { i.lnum, 0 })
+      vim.cmd 'normal! zz'
+    end,
+  }
 end
 
 local function insert_breakpoint_call()
