@@ -15,6 +15,8 @@ require 'core.pyformat' -- BufWritePost *.py -> ruff on modified hunks
 require 'core.terminal' -- <leader>tt, TermOpen mappings
 require 'core.picker' -- <leader>sf / sg / sw / sb / /
 require 'core.gitblame' -- <leader>gb
+require 'core.lualine' -- 'statusline' + LSP breadcrumbs
+require 'core.tabline' -- 'tabline' for tab pages
 
 -- PYTHONBREAKPOINT lives here rather than in pydebug so `breakpoint()` still routes to
 -- the debugger in a session where you never open a .py buffer.

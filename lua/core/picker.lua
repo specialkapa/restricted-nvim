@@ -78,6 +78,14 @@ local DEFAULT_ACTION = 'tabedit'
 -- 'none', 'single', 'double', 'rounded', 'solid', 'shadow', or an 8-element char list.
 local BORDER = 'single'
 
+-- ripgrep, when the machine has it. Two things change: `rg --files` replaces the Lua
+-- directory walk (and honours .gitignore), and grep becomes a real async live search
+-- with regex support instead of a substring scan over an in-memory index. Everything
+-- still works without it -- the pure-Lua paths below are the fallback.
+local RG = vim.fn.executable 'rg' == 1
+local HAS_SYSTEM = vim.system ~= nil
+local USE_RG = RG and HAS_SYSTEM
+
 local function root()
   local found = vim.fs.find({ '.git', 'pyproject.toml', 'setup.py' }, { upward = true, path = vim.fn.getcwd() })[1]
   return found and vim.fs.dirname(found) or vim.fn.getcwd()
@@ -86,6 +94,21 @@ end
 ---Every file under `dir`, relative to it. Prunes ignored directories DURING the walk
 ---rather than filtering afterwards -- that is what keeps it fast next to a .venv.
 local function list_files(dir)
+  if RG then
+    -- --files lists without searching; .gitignore is respected for free, which is
+    -- better pruning than SKIP_DIRS can manage.
+    local out = vim.fn.systemlist { 'rg', '--files', '--hidden', '--glob', '!.git/', '--path-separator', '/', dir }
+    if vim.v.shell_error == 0 then
+      local prefix = vim.fs.normalize(dir) .. '/'
+      for i, path in ipairs(out) do
+        local norm = vim.fs.normalize(path)
+        out[i] = norm:sub(1, #prefix) == prefix and norm:sub(#prefix + 1) or norm
+      end
+      return out
+    end
+    -- rg failed (not a directory, permissions); fall through to the Lua walk.
+  end
+
   local out = {}
   local function walk(path)
     if #out >= MAX_FILES then return end
@@ -201,6 +224,34 @@ vim.api.nvim_create_autocmd('BufWritePost', {
   end,
 })
 
+---Async live grep through ripgrep. Returns the job handle so a superseded query can be
+---killed rather than left running.
+---@param dir string
+---@param query string
+---@param cb fun(items: table[])
+local function rg_search(dir, query, cb)
+  return vim.system(
+    { 'rg', '--vimgrep', '--smart-case', '--color', 'never', '--max-columns', '500', '--', query },
+    { cwd = dir, text = true },
+    function(res)
+      local items = {}
+      -- rg exits 1 for "no matches", which is not an error.
+      for line in (res.stdout or ''):gmatch '[^\n]+' do
+        local file, lnum, text = line:match '^(.-):(%d+):%d+:(.*)$'
+        if file then
+          items[#items + 1] = { file = file, lnum = tonumber(lnum), text = vim.trim(text) }
+          if #items >= MAX_RESULTS then
+            break
+          end
+        end
+      end
+      vim.schedule(function()
+        cb(items)
+      end)
+    end
+  )
+end
+
 vim.api.nvim_create_user_command('PickerReindex', function()
   corpus_cache = {}
   vim.notify('grep index cleared', vim.log.levels.INFO)
@@ -217,8 +268,11 @@ local function pick(opts)
   -- Dynamic sources recompute their items from the query (live grep). Static ones are
   -- fuzzy-filtered with matchfuzzy against a fixed list.
   local dynamic = opts.dynamic
+  -- An async source takes (query, callback) instead of returning items. Results that
+  -- arrive after a newer query was typed are discarded via the generation counter.
+  local dynamic_async = opts.dynamic_async
 
-  if not dynamic and #(opts.items or {}) == 0 then
+  if not dynamic and not dynamic_async and #(opts.items or {}) == 0 then
     vim.notify('nothing to pick from', vim.log.levels.INFO)
     return
   end
@@ -236,6 +290,11 @@ local function pick(opts)
 
   set_items(opts.items or {})
   local filtered, sel = display, 1
+
+  -- Declared up here because close() below refers to them; a local defined later would
+  -- silently be a different (global) name inside that closure.
+  local generation = 0
+  local inflight
 
   local total_w = math.min(180, math.floor(vim.o.columns * 0.85))
   local height = math.min(24, math.floor(vim.o.lines * 0.6))
@@ -277,6 +336,12 @@ local function pick(opts)
   local function close()
     if closed then return end
     closed = true
+    if inflight then
+      pcall(function()
+        inflight:kill 'sigterm'
+      end)
+      inflight = nil
+    end
     -- Without this you land in the picked buffer still in insert mode.
     vim.cmd 'stopinsert'
     pcall(vim.api.nvim_win_close, prompt_win, true)
@@ -314,7 +379,8 @@ local function pick(opts)
       shown[i] = filtered[i]
     end
     if #shown == 0 then
-      shown = { dynamic and #display == 0 and '  (type to search)' or '  (no matches)' }
+      local live = dynamic or dynamic_async
+      shown = { live and #display == 0 and '  (type to search)' or '  (no matches)' }
     end
     vim.bo[list_buf].modifiable = true
     vim.api.nvim_buf_set_lines(list_buf, 0, -1, false, shown)
@@ -330,6 +396,36 @@ local function pick(opts)
 
   local function update()
     local query = vim.trim(vim.api.nvim_buf_get_lines(prompt_buf, 0, 1, false)[1] or '')
+
+    if dynamic_async then
+      -- Kill the previous search: on a fast typist every keystroke would otherwise
+      -- leave an rg process running to completion for a query already discarded.
+      if inflight then
+        pcall(function()
+          inflight:kill 'sigterm'
+        end)
+        inflight = nil
+      end
+      generation = generation + 1
+      local gen = generation
+      if query == '' then
+        set_items {}
+        filtered, sel = display, 1
+        render()
+        return
+      end
+      inflight = dynamic_async(query, function(items)
+        if closed or gen ~= generation then
+          return -- a newer query already went out
+        end
+        inflight = nil
+        set_items(items)
+        filtered, sel = display, 1
+        render()
+      end)
+      return
+    end
+
     if dynamic then
       -- The query IS the search; no fuzzy pass on top of it.
       set_items(query == '' and {} or dynamic(query))
@@ -345,7 +441,7 @@ local function pick(opts)
   -- A live scan per keystroke would fire mid-word; coalesce bursts of typing.
   local timer
   local function queue_update()
-    if not dynamic then
+    if not dynamic and not dynamic_async then
       return update()
     end
     if timer then timer:stop() end
@@ -383,6 +479,26 @@ local function pick(opts)
     end
   end
 
+  ---Copy the highlighted entry's file path. Sources opt in by supplying opts.path;
+  ---those without one (buffer lines) simply do nothing. The picker stays open, so you
+  ---can look at the preview and copy without losing your place.
+  local function yank_path()
+    if not opts.path then
+      return
+    end
+    local text = filtered[sel]
+    local item = text and by_text[text]
+    local path = item and opts.path(item)
+    if not path or path == '' then
+      return
+    end
+    vim.fn.setreg('"', path)
+    -- The + register needs a clipboard provider (xclip/wl-copy/win32yank). On a
+    -- locked-down box there may be none, so this is best-effort; " always works.
+    local clipboard = vim.fn.has('clipboard') == 1 and pcall(vim.fn.setreg, '+', path)
+    vim.notify(path .. (clipboard and '' or '   (yanked to \" only -- no clipboard provider)'), vim.log.levels.INFO)
+  end
+
   local map = function(lhs, fn)
     vim.keymap.set({ 'i', 'n' }, lhs, fn, { buffer = prompt_buf, nowait = true })
   end
@@ -398,6 +514,7 @@ local function pick(opts)
   map('<C-p>', function() move(-1) end)
   map('<Down>', function() move(1) end)
   map('<Up>', function() move(-1) end)
+  map('<C-y>', yank_path)
   map('<C-d>', function() scroll_preview(10) end)
   map('<C-u>', function() scroll_preview(-10) end)
 
@@ -423,6 +540,7 @@ function M.files()
     prompt = 'Files',
     items = list_files(dir),
     preview = function(rel) return file_preview(vim.fs.normalize(dir .. '/' .. rel), 1) end,
+    path = function(rel) return vim.fs.normalize(dir .. '/' .. rel) end,
     on_choice = function(rel, action)
       vim.cmd[action](vim.fn.fnameescape(vim.fs.normalize(dir .. '/' .. rel)))
     end,
@@ -442,6 +560,7 @@ function M.buffers()
     items = items,
     format = function(i) return i.name end,
     preview = function(i) return file_preview(i.path, 1) end,
+    path = function(i) return i.path end,
     -- Via the path rather than nvim_set_current_buf, so tabedit/vsplit/split all work.
     on_choice = function(i, action) vim.cmd[action](vim.fn.fnameescape(i.path)) end,
   }
@@ -451,16 +570,28 @@ end
 ---in-memory corpus. Plain substring, case-insensitive.
 local function live_grep(initial)
   local dir = root()
-  if not corpus_cache[dir] then
-    vim.notify('indexing project for grep...', vim.log.levels.INFO)
-    corpus(dir) -- pay the read cost once, before the picker opens
+
+  -- With ripgrep: a real async regex search per keystroke, nothing held in memory.
+  -- Without it: the in-memory corpus, which must be read once up front.
+  local source
+  if USE_RG then
+    source = { dynamic_async = function(query, cb) return rg_search(dir, query, cb) end }
+  else
+    if not corpus_cache[dir] then
+      vim.notify('indexing project for grep...', vim.log.levels.INFO)
+      corpus(dir) -- pay the read cost once, before the picker opens
+    end
+    source = { dynamic = function(query) return search(dir, query) end }
   end
+
   pick {
-    prompt = 'Grep',
+    prompt = USE_RG and 'Grep (rg)' or 'Grep',
     initial = initial,
-    dynamic = function(query) return search(dir, query) end,
+    dynamic = source.dynamic,
+    dynamic_async = source.dynamic_async,
     format = function(r) return ('%s:%d: %s'):format(r.file, r.lnum, r.text) end,
     preview = function(r) return file_preview(vim.fs.normalize(dir .. '/' .. r.file), r.lnum) end,
+    path = function(r) return vim.fs.normalize(dir .. '/' .. r.file) end,
     on_choice = function(r, action)
       vim.cmd[action](vim.fn.fnameescape(vim.fs.normalize(dir .. '/' .. r.file)))
       pcall(vim.api.nvim_win_set_cursor, 0, { r.lnum, 0 })
@@ -492,6 +623,11 @@ function M.grep_word()
   if query == '' then
     vim.notify('nothing under the cursor to search for', vim.log.levels.WARN)
     return
+  end
+  -- rg treats the query as a regex, so a symbol like `foo(` or `a.b` would misbehave;
+  -- escape it. The Lua fallback matches literally, so it needs no escaping.
+  if USE_RG then
+    query = query:gsub('[%^%$%(%)%.%[%]%*%+%-%?{}|\\/]', '\\%1')
   end
   -- Seed the live picker rather than freezing the pattern, so you can refine it.
   live_grep(query)
