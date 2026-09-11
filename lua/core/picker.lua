@@ -482,8 +482,29 @@ local function pick(opts)
   ---Copy the highlighted entry's file path. Sources opt in by supplying opts.path;
   ---those without one (buffer lines) simply do nothing. The picker stays open, so you
   ---can look at the preview and copy without losing your place.
+  ---Flash a message in the prompt border for `ms`, then restore the normal title.
+  ---Confirmation has to live INSIDE the picker: a vim.notify lands on the command line,
+  ---which the picker's own redraw wipes immediately -- and shows nothing at all under
+  ---cmdheight=0.
+  local function flash_title(message, ms)
+    if closed then
+      return
+    end
+    local budget = total_w - 4
+    if #message > budget then
+      message = '...' .. message:sub(#message - budget + 4)
+    end
+    pcall(vim.api.nvim_win_set_config, prompt_win, { title = ' ' .. message .. ' ', title_pos = 'center' })
+    vim.defer_fn(function()
+      if not closed then
+        render() -- puts the "Files 12/840" counter back
+      end
+    end, ms or 1500)
+  end
+
   local function yank_path()
     if not opts.path then
+      flash_title('no path for this source')
       return
     end
     local text = filtered[sel]
@@ -493,10 +514,12 @@ local function pick(opts)
       return
     end
     vim.fn.setreg('"', path)
-    -- The + register needs a clipboard provider (xclip/wl-copy/win32yank). On a
-    -- locked-down box there may be none, so this is best-effort; " always works.
+    -- The + register needs a clipboard provider; core/clipboard.lua wires one up where
+    -- the platform allows. Best-effort, because " always works regardless.
     local clipboard = vim.fn.has('clipboard') == 1 and pcall(vim.fn.setreg, '+', path)
-    vim.notify(path .. (clipboard and '' or '   (yanked to \" only -- no clipboard provider)'), vim.log.levels.INFO)
+    flash_title((clipboard and 'copied  ' or 'yanked to " only  ') .. path)
+    -- Recorded as well, so :messages still has the full path after the flash clears.
+    vim.notify('yanked: ' .. path, vim.log.levels.INFO)
   end
 
   local map = function(lhs, fn)

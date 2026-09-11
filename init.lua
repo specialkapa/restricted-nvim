@@ -9,6 +9,7 @@
 require 'core.options'
 require 'core.keymaps'
 
+require 'core.clipboard' -- wires up a clipboard provider if none exists
 require 'core.completion' -- sets 'completeopt' globally
 require 'core.lsp' -- FileType python -> vim.lsp.start
 require 'core.pyformat' -- BufWritePost *.py -> ruff on modified hunks

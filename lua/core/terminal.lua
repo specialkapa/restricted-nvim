@@ -104,6 +104,26 @@ local function run(cmd, opts)
   end
 end
 
+---Send a register's contents to the program running in the terminal.
+---Bound to <C-\><C-r>{reg}, deliberately NOT <C-r>: that is bash's reverse history
+---search and readline would lose it. Mirrors the command line's <C-r>{reg}.
+local function paste_register(bufnr)
+  local ok, reg = pcall(vim.fn.getcharstr)
+  if not ok or reg == nil or reg == '' then
+    return
+  end
+  local text = vim.fn.getreg(reg)
+  if text == nil or text == '' then
+    return
+  end
+  -- Trailing newline would submit the line; you almost always want to keep typing.
+  text = text:gsub('\n$', '')
+  local chan = vim.bo[bufnr].channel
+  if chan and chan > 0 then
+    vim.api.nvim_chan_send(chan, text)
+  end
+end
+
 -- Terminal-mode mappings. <C-h>/<C-l> are deliberately NOT mapped: those are tab
 -- navigation here, and stealing them would also cost IPython's <C-l> clear-screen at a
 -- debugger prompt. <C-j>/<C-k> cover the horizontal split; <C-w> reaches everything else.
@@ -116,6 +136,9 @@ vim.api.nvim_create_autocmd('TermOpen', {
     vim.keymap.set('t', '<C-j>', [[<Cmd>wincmd j<CR>]], opts)
     vim.keymap.set('t', '<C-k>', [[<Cmd>wincmd k<CR>]], opts)
     vim.keymap.set('t', '<C-w>', [[<C-\><C-n><C-w>]], opts)
+    vim.keymap.set('t', [[<C-\><C-r>]], function()
+      paste_register(args.buf)
+    end, vim.tbl_extend('force', opts, { desc = 'Paste a register into the terminal' }))
     vim.opt_local.spell = false
   end,
 })
