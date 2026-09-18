@@ -23,6 +23,7 @@ local diff_opts = { result_type = 'indices', algorithm = 'histogram', ignore_whi
 
 local writing = false -- guard so the write-back never re-enters this handler
 local warned = false
+local stderr_warned = false
 
 ---Run `git -C <dir> <args...>`, returning (stdout, exit_code).
 local function git(dir, args)
@@ -55,7 +56,15 @@ end
 ---against. `:./name` resolves relative to the -C directory, so no path plumbing needed.
 local function comparee_lines(dir, bufname)
   local rev = ':./' .. vim.fn.fnamemodify(bufname, ':t')
-  local content, code = git(dir, { 'show', rev })
+  -- Same stderr hazard as above: a git warning merged into the blob content would shift
+  -- every line and make the whole file look modified.
+  local content, code
+  if vim.system then
+    local res = vim.system({ 'git', '-C', dir, 'show', rev }, { text = true }):wait()
+    content, code = res.stdout or '', res.code
+  else
+    content, code = git(dir, { 'show', rev })
+  end
   if code ~= 0 then
     return nil, 'failed to read git index version'
   end
@@ -77,7 +86,7 @@ local function ruff_format(input, bufname)
     return nil, 'ruff not found'
   end
 
-  local output = vim.fn.system({
+  local cmd = {
     exe,
     'format',
     '--line-length',
@@ -85,11 +94,37 @@ local function ruff_format(input, bufname)
     '--stdin-filename',
     bufname == '' and 'stdin.py' or bufname,
     '-',
-  }, input)
-  if vim.v.shell_error ~= 0 then
-    return nil, output
+  }
+
+  -- vim.system() keeps stdout and stderr SEPARATE. vim.fn.system() merges them, and
+  -- ruff writes configuration warnings to stderr -- so with the old call any warning
+  -- ("D203 and D211 are incompatible...") was treated as formatted source and written
+  -- into the buffer, corrupting the file on save.
+  local out, err, code
+  if vim.system then
+    local res = vim.system(cmd, { stdin = input, text = true }):wait()
+    out, err, code = res.stdout, res.stderr, res.code
+  else
+    -- Older Neovim: discard stderr at the shell rather than let it reach the buffer.
+    local quoted = {}
+    for i, arg in ipairs(cmd) do
+      quoted[i] = vim.fn.shellescape(arg)
+    end
+    out = vim.fn.system(table.concat(quoted, ' ') .. ' 2>/dev/null', input)
+    err, code = '', vim.v.shell_error
   end
-  return output, nil
+
+  -- Surface a configuration warning once, rather than swallowing it -- it means your
+  -- pyproject.toml has a problem worth fixing.
+  if err and err ~= '' and not stderr_warned then
+    stderr_warned = true
+    vim.notify('ruff: ' .. vim.trim(err), vim.log.levels.WARN)
+  end
+
+  if code ~= 0 then
+    return nil, (err and err ~= '' and err) or out or 'ruff format failed'
+  end
+  return out, nil
 end
 
 ---Mutates the buffer in place; returns true if anything changed.

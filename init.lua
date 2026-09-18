@@ -14,6 +14,7 @@ require 'core.completion' -- sets 'completeopt' globally
 require 'core.lsp' -- FileType python -> vim.lsp.start
 require 'core.pyformat' -- BufWritePost *.py -> ruff on modified hunks
 require 'core.terminal' -- <leader>tt, TermOpen mappings
+require 'core.explorer' -- <leader>E reveal file in netrw
 require 'core.picker' -- <leader>sf / sg / sw / sb / /
 require 'core.gitblame' -- <leader>gb
 require 'core.lualine' -- 'statusline' + LSP breadcrumbs
