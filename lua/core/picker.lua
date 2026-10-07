@@ -112,6 +112,29 @@ local RG = vim.fn.executable("rg") == 1
 local HAS_SYSTEM = vim.system ~= nil
 local USE_RG = RG and HAS_SYSTEM
 
+-- Fraction of the picker's width given to the results list; the preview takes the rest.
+-- Remembered at module scope, so moving the divider in the file picker and then opening
+-- the grep picker keeps the split you just chose.
+local SPLIT_RATIO = 0.45
+local MIN_PANE = 20 -- columns; neither side may be squeezed below this
+local DIVIDER_STEP = 4 -- columns moved per keypress
+
+---Geometry for the three floats. The OUTER size is fixed -- only the divider between
+---the list and the preview moves.
+local function compute_layout(has_preview)
+  local total_w = math.min(180, math.floor(vim.o.columns * 0.85))
+  local height = math.min(24, math.floor(vim.o.lines * 0.6))
+  local list_w = has_preview and math.floor(total_w * SPLIT_RATIO) or total_w
+  return {
+    total_w = total_w,
+    height = height,
+    list_w = list_w,
+    prev_w = total_w - list_w - 2, -- 2 = the two adjoining borders, no gap between
+    col = math.floor((vim.o.columns - total_w) / 2),
+    row = math.max(1, math.floor((vim.o.lines - height) / 2) - 2),
+  }
+end
+
 local function root()
 	local found = vim.fs.find({ ".git", "pyproject.toml", "setup.py" }, { upward = true, path = vim.fn.getcwd() })[1]
 	return found and vim.fs.dirname(found) or vim.fn.getcwd()
@@ -336,12 +359,8 @@ local function pick(opts)
 	local generation = 0
 	local inflight
 
-	local total_w = math.min(180, math.floor(vim.o.columns * 0.85))
-	local height = math.min(24, math.floor(vim.o.lines * 0.6))
-	local list_w = has_preview and math.floor(total_w * 0.45) or total_w
-	local prev_w = total_w - list_w - 2 -- 2 = the two adjoining borders, no gap between
-	local col = math.floor((vim.o.columns - total_w) / 2)
-	local row = math.max(1, math.floor((vim.o.lines - height) / 2) - 2)
+	local L = compute_layout(has_preview)
+	local total_w = L.total_w
 
 	local list_buf = vim.api.nvim_create_buf(false, true)
 	local prompt_buf = vim.api.nvim_create_buf(false, true)
@@ -349,30 +368,30 @@ local function pick(opts)
 
 	local list_win = vim.api.nvim_open_win(list_buf, false, {
 		relative = "editor",
-		width = list_w,
-		height = height,
-		col = col,
-		row = row + 3,
+		width = L.list_w,
+		height = L.height,
+		col = L.col,
+		row = L.row + 3,
 		style = "minimal",
 		border = BORDER,
 	})
 	local prev_win = has_preview
 			and vim.api.nvim_open_win(prev_buf, false, {
 				relative = "editor",
-				width = prev_w,
-				height = height,
-				col = col + list_w + 2,
-				row = row + 3,
+				width = L.prev_w,
+				height = L.height,
+				col = L.col + L.list_w + 2,
+				row = L.row + 3,
 				style = "minimal",
 				border = BORDER,
 			})
 		or nil
 	local prompt_win = vim.api.nvim_open_win(prompt_buf, true, {
 		relative = "editor",
-		width = total_w,
+		width = L.total_w,
 		height = 1,
-		col = col,
-		row = row,
+		col = L.col,
+		row = L.row,
 		style = "minimal",
 		border = BORDER,
 		title = " " .. (opts.prompt or "Pick") .. " ",
@@ -606,6 +625,45 @@ local function pick(opts)
 		vim.notify("yanked: " .. path, vim.log.levels.INFO)
 	end
 
+	---Move the boundary between the results list and the preview by `cols`, keeping the
+	---picker's outer width, position and height fixed. Only the two lower windows are
+	---reconfigured; the prompt spans the full width and never changes.
+	local function move_divider(cols)
+		if not prev_win or closed then
+			return
+		end
+		local cur = vim.api.nvim_win_get_width(list_win)
+		-- 2 columns are consumed by the two adjoining borders.
+		local usable = L.total_w - 2
+		local new_list = math.max(MIN_PANE, math.min(cur + cols, usable - MIN_PANE))
+		if new_list == cur then
+			return -- already against a stop; do not thrash the windows
+		end
+
+		pcall(vim.api.nvim_win_set_config, list_win, {
+			relative = "editor",
+			width = new_list,
+			height = L.height,
+			col = L.col,
+			row = L.row + 3,
+			border = BORDER,
+		})
+		pcall(vim.api.nvim_win_set_config, prev_win, {
+			relative = "editor",
+			width = usable - new_list,
+			height = L.height,
+			col = L.col + new_list + 2,
+			row = L.row + 3,
+			border = BORDER,
+		})
+		-- Remember it for the next picker in this session.
+		SPLIT_RATIO = new_list / L.total_w
+		-- render_preview() short-circuits when the highlighted entry is unchanged, which
+		-- it is here -- clear the cache so the content re-centres at the new width.
+		last_preview = nil
+		render_preview()
+	end
+
 	local map = function(lhs, fn)
 		vim.keymap.set({ "i", "n" }, lhs, fn, { buffer = prompt_buf, nowait = true })
 	end
@@ -640,6 +698,14 @@ local function pick(opts)
 		move(-1)
 	end)
 	map("<C-y>", yank_path)
+	-- Arrows are picker controls here, not text motions: Up/Down move the selection,
+	-- Left/Right move the divider. Editing the query is backspace and typing.
+	map("<Left>", function()
+		move_divider(-DIVIDER_STEP)
+	end)
+	map("<Right>", function()
+		move_divider(DIVIDER_STEP)
+	end)
 	map("<C-d>", function()
 		scroll_preview(10)
 	end)
