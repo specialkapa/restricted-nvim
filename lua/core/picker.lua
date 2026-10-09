@@ -11,6 +11,7 @@
 --   <leader>sb  switch buffer
 --   <leader>s.  recent files, from anywhere on disk
 --   <leader>ss  symbols in the current file (needs a language server: ty or pylsp)
+--   <leader>sk  keymaps -- <CR> runs a normal-mode mapping, the preview shows its code
 --   <leader>/   fuzzy find lines in the current buffer
 
 local uv = vim.uv or vim.loop
@@ -199,7 +200,10 @@ local function file_preview(path, lnum)
 	if ext and BINARY[ext:lower()] then
 		return { lines = { "-- binary file --" } }
 	end
-	local ok, lines = pcall(vim.fn.readfile, path, "", PREVIEW_LINES)
+	-- Read far enough to reach lnum with context below it; a fixed cap would silently
+	-- clamp a match on line 900 to the last line read.
+	local limit = math.max(PREVIEW_LINES, (lnum or 1) + PREVIEW_LINES / 2)
+	local ok, lines = pcall(vim.fn.readfile, path, "", limit)
 	if not ok then
 		return nil
 	end
@@ -328,7 +332,8 @@ end, { desc = "Drop the cached grep index" })
 -- The picker: prompt on top, results left, optional preview right.
 -- ---------------------------------------------------------------------------
 
----@param opts table items|dynamic, prompt, on_choice, format(item), preview(item), initial
+---@param opts table items|dynamic, prompt, on_choice, format(item), preview(item), initial,
+---  on_enter(item) -- optional: what <CR> does when it is not "open with DEFAULT_ACTION"
 local function pick(opts)
 	local format = opts.format or tostring
 	local has_preview = opts.preview ~= nil
@@ -576,12 +581,13 @@ local function pick(opts)
 	end
 
 	---@param action string an Ex command: 'edit', 'tabedit', 'vsplit', 'split'
-	local function accept(action)
+	---@param handler? fun(item: any, action: string) defaults to opts.on_choice
+	local function accept(action, handler)
 		local text = filtered[sel]
 		close()
 		if text and by_text[text] then
 			vim.schedule(function()
-				opts.on_choice(by_text[text], action or "edit")
+				(handler or opts.on_choice)(by_text[text], action or "edit")
 			end)
 		end
 	end
@@ -672,7 +678,9 @@ local function pick(opts)
 		vim.keymap.set({ "i", "n" }, lhs, fn, { buffer = prompt_buf, nowait = true })
 	end
 	map("<CR>", function()
-		accept(DEFAULT_ACTION)
+		-- DEFAULT_ACTION can equal an override (both 'tabedit' by default), so a source
+		-- that needs <CR> to mean something else gets its own hook rather than a string.
+		accept(DEFAULT_ACTION, opts.on_enter)
 	end)
 	-- Telescope's open-in conventions, plus <C-e> to force the current window.
 	map("<C-e>", function()
@@ -1259,6 +1267,108 @@ function M.symbols()
 	end)
 end
 
+---Where a mapping's behaviour is defined, as { path, lnum }, or nil.
+---
+---Mappings set from Lua do not record their source (sid -8, lnum 0) unless Neovim was
+---started with -V1, but their callback function knows where IT was written -- which is
+---the code the key actually runs, so arguably the better place to land anyway.
+---Vimscript mappings do record the script and line that defined them.
+local function keymap_source(m)
+	if m.callback then
+		local info = debug.getinfo(m.callback, "S")
+		if info and info.source:sub(1, 1) == "@" then
+			return { path = vim.fs.normalize(info.source:sub(2)), lnum = math.max(1, info.linedefined) }
+		end
+	elseif m.sid and m.sid > 0 then
+		local ok, scripts = pcall(vim.fn.getscriptinfo, { sid = m.sid })
+		if ok and scripts[1] then
+			return { path = vim.fs.normalize(scripts[1].name), lnum = math.max(1, m.lnum or 1) }
+		end
+	end
+	return nil
+end
+
+---Every mapping in normal, visual, insert and terminal mode, global and buffer-local,
+---searchable by keys and description. <leader> is shown as <leader>, not a space.
+---
+---<CR> runs a normal-mode mapping in the window you came from; for other modes it opens
+---the definition instead, since replaying insert or visual keys out of context does
+---nothing useful. <C-e>/<C-t>/<C-v>/<C-x> always open the definition.
+function M.keymaps()
+	local buf = vim.api.nvim_get_current_buf()
+	local win = vim.api.nvim_get_current_win()
+	local leader = vim.g.mapleader or "\\"
+
+	local function display_lhs(lhs)
+		if leader ~= "" and lhs:sub(1, #leader) == leader then
+			return "<leader>" .. vim.fn.keytrans(lhs:sub(#leader + 1))
+		end
+		return vim.fn.keytrans(lhs)
+	end
+
+	local items = {}
+	for _, mode in ipairs({ "n", "x", "i", "t" }) do
+		-- Buffer-local first: they shadow a global mapping with the same keys.
+		for _, scope in ipairs({ vim.api.nvim_buf_get_keymap(buf, mode), vim.api.nvim_get_keymap(mode) }) do
+			for _, m in ipairs(scope) do
+				-- <Plug> and <SNR> mappings are plumbing for other mappings, not keys you press.
+				if not m.lhs:find("^<Plug>") and not m.lhs:find("^<SNR>") then
+					items[#items + 1] = {
+						mode = mode,
+						lhs = m.lhs,
+						lhsraw = m.lhsraw,
+						keys = display_lhs(m.lhs),
+						desc = (m.desc and m.desc ~= "") and m.desc
+							or (m.rhs and m.rhs ~= "" and m.rhs)
+							or "<Lua function>",
+						buffer = m.buffer ~= 0,
+						source = keymap_source(m),
+					}
+				end
+			end
+		end
+	end
+
+	local function open_source(i, action)
+		if not i.source then
+			vim.notify("no source location for " .. i.keys, vim.log.levels.INFO)
+			return
+		end
+		vim.cmd[action](vim.fn.fnameescape(i.source.path))
+		pcall(vim.api.nvim_win_set_cursor, 0, { i.source.lnum, 0 })
+		vim.cmd("normal! zz")
+	end
+
+	pick({
+		prompt = "Keymaps",
+		items = items,
+		format = function(i)
+			return ("%s  %-16s %s%s"):format(i.mode, i.keys, i.desc, i.buffer and "  [buffer]" or "")
+		end,
+		preview = function(i)
+			if i.source then
+				return file_preview(i.source.path, i.source.lnum)
+			end
+			return { lines = { "-- no source location (built-in or defined from a string) --" } }
+		end,
+		path = function(i)
+			return i.source and i.source.path
+		end,
+		on_enter = function(i)
+			if i.mode ~= "n" then
+				open_source(i, DEFAULT_ACTION)
+				return
+			end
+			if vim.api.nvim_win_is_valid(win) then
+				vim.api.nvim_set_current_win(win)
+			end
+			-- "m" so the keys go through the mapping table; that is the whole point.
+			vim.api.nvim_feedkeys(i.lhsraw or vim.api.nvim_replace_termcodes(i.lhs, true, true, true), "m", false)
+		end,
+		on_choice = open_source,
+	})
+end
+
 -- Exported so other modules can build their own pickers on the same widget rather than
 -- falling back to vim.ui.select, which without a plugin is a numbered command-line
 -- prompt. See browse_breakpoints in core/pydebug.lua.
@@ -1276,6 +1386,7 @@ vim.keymap.set("n", "<leader>sgg", M.grep_dir, { desc = "[S]earch by [GG]rep in 
 vim.keymap.set({ "n", "x" }, "<leader>sw", M.grep_word, { desc = "[S]earch current [W]ord" })
 vim.keymap.set("n", "<leader>sb", M.buffers, { desc = "[S]earch [B]uffers" })
 vim.keymap.set("n", "<leader>ss", M.symbols, { desc = "[S]earch [S]ymbols in the current file" })
+vim.keymap.set("n", "<leader>sk", M.keymaps, { desc = "[S]earch [K]eymaps" })
 vim.keymap.set("n", "<leader>s.", M.oldfiles, { desc = "[S]earch recent files ('.' for repeat)" })
 vim.keymap.set("n", "<leader>gs", M.git_files, { desc = "[G]it [S]tatus -- changed files" })
 vim.keymap.set("n", "<leader>g/", M.git_hunks, { desc = "[G]it [H]unks in the current file" })
