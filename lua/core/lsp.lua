@@ -182,7 +182,10 @@ vim.api.nvim_create_autocmd('LspAttach', {
     end
 
     map('gd', vim.lsp.buf.definition, 'Goto definition')
-    map('gr', vim.lsp.buf.references, 'Goto references')
+    -- In the picker rather than the quickfix window: previews and split/tab opens.
+    map('gr', function()
+      require('core.picker').references()
+    end, 'Goto references')
     map('K', vim.lsp.buf.hover, 'Hover documentation')
     map('<leader>rn', vim.lsp.buf.rename, 'Rename')
     map('<leader>ca', vim.lsp.buf.code_action, 'Code action')

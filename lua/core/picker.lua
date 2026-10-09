@@ -11,6 +11,7 @@
 --   <leader>sb  switch buffer
 --   <leader>s.  recent files, from anywhere on disk
 --   <leader>ss  symbols in the current file (needs a language server: ty or pylsp)
+--   gr          LSP references to the symbol under the cursor (mapped in core/lsp.lua)
 --   <leader>sk  keymaps -- <CR> runs a normal-mode mapping, the preview shows its code
 --   <leader>/   fuzzy find lines in the current buffer
 
@@ -1261,6 +1262,100 @@ function M.symbols()
 					vim.api.nvim_set_current_win(win)
 					pcall(vim.api.nvim_win_set_cursor, win, { i.lnum, i.col })
 				end
+				vim.cmd("normal! zz")
+			end,
+		})
+	end)
+end
+
+---Every reference to the symbol under the cursor, from textDocument/references, in the
+---picker rather than the quickfix window. Includes the declaration itself, so the list
+---is never empty just because a name is used only once.
+---
+---Line text and previews come from the loaded buffer when there is one, not the file on
+---disk: the server answers against unsaved edits, and so must the preview.
+function M.references()
+	local buf = vim.api.nvim_get_current_buf()
+	local method = "textDocument/references"
+	local clients = vim.lsp.get_clients({ bufnr = buf, method = method })
+	if #clients == 0 then
+		vim.notify("no language server with references attached", vim.log.levels.WARN)
+		return
+	end
+	local word = vim.fn.expand("<cword>")
+
+	-- One encoding for the request; every client in practice here (ty, pylsp) is utf-16.
+	local params = vim.tbl_extend("force", vim.lsp.util.make_position_params(0, clients[1].offset_encoding), {
+		context = { includeDeclaration = true },
+	})
+
+	vim.lsp.buf_request_all(buf, method, params, function(results)
+		local files = {}
+		local function lines_of(path)
+			if not files[path] then
+				local b = vim.fn.bufnr(path)
+				if b ~= -1 and vim.api.nvim_buf_is_loaded(b) then
+					files[path] = vim.api.nvim_buf_get_lines(b, 0, -1, false)
+				else
+					local ok, lines = pcall(vim.fn.readfile, path)
+					files[path] = ok and lines or {}
+				end
+			end
+			return files[path]
+		end
+
+		-- Two servers can both answer; key on position so each reference appears once.
+		local items, seen = {}, {}
+		for client_id, res in pairs(results) do
+			local client = vim.lsp.get_client_by_id(client_id)
+			local encoding = client and client.offset_encoding or "utf-16"
+			for _, loc in ipairs(res.result or {}) do
+				local path = vim.fs.normalize(vim.uri_to_fname(loc.uri))
+				local start = loc.range.start
+				local key = ("%s:%d:%d"):format(path, start.line, start.character)
+				if not seen[key] then
+					seen[key] = true
+					local line = lines_of(path)[start.line + 1] or ""
+					-- LSP columns are in the server's encoding (usually UTF-16); convert to bytes.
+					local ok, col = pcall(vim.str_byteindex, line, encoding, start.character, false)
+					items[#items + 1] = {
+						path = path,
+						file = vim.fn.fnamemodify(path, ":~:."),
+						lnum = start.line + 1,
+						col = ok and col or 0,
+						text = vim.trim(line),
+					}
+				end
+			end
+		end
+
+		if #items == 0 then
+			vim.notify("no references to " .. word, vim.log.levels.INFO)
+			return
+		end
+		table.sort(items, function(a, b)
+			if a.file ~= b.file then
+				return a.file < b.file
+			end
+			return a.lnum < b.lnum
+		end)
+
+		pick({
+			prompt = ("References: %s (%d)"):format(word, #items),
+			items = items,
+			-- The column is part of the text so two references on one line stay distinct.
+			format = function(r)
+				return ("%s:%d:%d: %s"):format(r.file, r.lnum, r.col + 1, r.text)
+			end,
+			preview = function(r)
+				return { lines = lines_of(r.path), ft = vim.filetype.match({ filename = r.path }), lnum = r.lnum }
+			end,
+			path = function(r)
+				return r.path
+			end,
+			on_choice = function(r, action)
+				vim.cmd[action](vim.fn.fnameescape(r.path))
+				pcall(vim.api.nvim_win_set_cursor, 0, { r.lnum, r.col })
 				vim.cmd("normal! zz")
 			end,
 		})
