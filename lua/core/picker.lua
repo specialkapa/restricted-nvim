@@ -10,6 +10,7 @@
 --   <leader>sw  grep the word under the cursor / visual selection
 --   <leader>sb  switch buffer
 --   <leader>s.  recent files, from anywhere on disk
+--   <leader>ss  symbols in the current file (needs a language server: ty or pylsp)
 --   <leader>/   fuzzy find lines in the current buffer
 
 local uv = vim.uv or vim.loop
@@ -1166,6 +1167,98 @@ function M.buffer_lines()
 	})
 end
 
+---Classes, functions, methods and constants in the current buffer, from the language
+---server's textDocument/documentSymbol. ruff does not provide symbols; ty and pylsp do.
+---
+---Names are shown qualified (Foo.bar), so a fuzzy query can target a method by its
+---class and two __init__s stay distinguishable. The kind is part of the text too, so
+---typing "class" or "method" filters by kind.
+function M.symbols()
+	local buf = vim.api.nvim_get_current_buf()
+	local win = vim.api.nvim_get_current_win()
+	local method = "textDocument/documentSymbol"
+	if #vim.lsp.get_clients({ bufnr = buf, method = method }) == 0 then
+		vim.notify("no language server with document symbols attached", vim.log.levels.WARN)
+		return
+	end
+
+	local params = { textDocument = vim.lsp.util.make_text_document_params(buf) }
+	vim.lsp.buf_request_all(buf, method, params, function(results)
+		local items = {}
+		local function add(name, kind, range, encoding)
+			local line = vim.api.nvim_buf_get_lines(buf, range.start.line, range.start.line + 1, false)[1] or ""
+			-- LSP columns are in the server's encoding (usually UTF-16); convert to bytes.
+			local ok, col = pcall(vim.str_byteindex, line, encoding, range.start.character, false)
+			items[#items + 1] = {
+				name = name,
+				kind = vim.lsp.protocol.SymbolKind[kind] or "?",
+				lnum = range.start.line + 1,
+				col = ok and col or 0,
+			}
+		end
+
+		-- Two response shapes: nested DocumentSymbol[] (ty), or flat SymbolInformation[]
+		-- with a containerName (pylsp). Take the first server that answers, so two
+		-- capable servers do not list everything twice.
+		for client_id, res in pairs(results) do
+			if res.result and #res.result > 0 then
+				local client = vim.lsp.get_client_by_id(client_id)
+				local encoding = client and client.offset_encoding or "utf-16"
+				local function walk(syms, prefix)
+					for _, s in ipairs(syms) do
+						local name = prefix and (prefix .. "." .. s.name) or s.name
+						if s.location then
+							if s.containerName and s.containerName ~= "" then
+								name = s.containerName .. "." .. s.name
+							end
+							add(name, s.kind, s.location.range, encoding)
+						else
+							-- selectionRange is the name itself; range would land on a decorator.
+							add(name, s.kind, s.selectionRange or s.range, encoding)
+							walk(s.children or {}, name)
+						end
+					end
+				end
+				walk(res.result, nil)
+				break
+			end
+		end
+
+		if #items == 0 then
+			vim.notify("no symbols in this file", vim.log.levels.INFO)
+			return
+		end
+		table.sort(items, function(a, b)
+			return a.lnum < b.lnum
+		end)
+
+		local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+		local ft = vim.bo[buf].filetype
+		pick({
+			prompt = "Symbols",
+			items = items,
+			format = function(i)
+				return ("%4d  %-11s %s"):format(i.lnum, i.kind, i.name)
+			end,
+			preview = function(i)
+				return { lines = lines, ft = ft, lnum = i.lnum }
+			end,
+			on_choice = function(i, action)
+				local name = vim.api.nvim_buf_get_name(buf)
+				-- Same as buffer_lines: <CR> stays in this window, an override reopens.
+				if action ~= DEFAULT_ACTION and name ~= "" then
+					vim.cmd[action](vim.fn.fnameescape(name))
+					pcall(vim.api.nvim_win_set_cursor, 0, { i.lnum, i.col })
+				else
+					vim.api.nvim_set_current_win(win)
+					pcall(vim.api.nvim_win_set_cursor, win, { i.lnum, i.col })
+				end
+				vim.cmd("normal! zz")
+			end,
+		})
+	end)
+end
+
 -- Exported so other modules can build their own pickers on the same widget rather than
 -- falling back to vim.ui.select, which without a plugin is a numbered command-line
 -- prompt. See browse_breakpoints in core/pydebug.lua.
@@ -1182,6 +1275,7 @@ vim.keymap.set("n", "<leader>sg", M.grep, { desc = "[S]earch by [G]rep" })
 vim.keymap.set("n", "<leader>sgg", M.grep_dir, { desc = "[S]earch by [GG]rep in a directory" })
 vim.keymap.set({ "n", "x" }, "<leader>sw", M.grep_word, { desc = "[S]earch current [W]ord" })
 vim.keymap.set("n", "<leader>sb", M.buffers, { desc = "[S]earch [B]uffers" })
+vim.keymap.set("n", "<leader>ss", M.symbols, { desc = "[S]earch [S]ymbols in the current file" })
 vim.keymap.set("n", "<leader>s.", M.oldfiles, { desc = "[S]earch recent files ('.' for repeat)" })
 vim.keymap.set("n", "<leader>gs", M.git_files, { desc = "[G]it [S]tatus -- changed files" })
 vim.keymap.set("n", "<leader>g/", M.git_hunks, { desc = "[G]it [H]unks in the current file" })
