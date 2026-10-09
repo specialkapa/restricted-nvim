@@ -4,6 +4,7 @@
 -- builtin matchfuzzy(), grep from reading files in Lua. No ripgrep, no fd.
 --
 --   <leader>sf  find files
+--   <leader>sF  find files in a directory you pick (defaults to the buffer's dir)
 --   <leader>sg  live grep -- type in the prompt, results update as you go
 --   <leader>sG  live grep in a directory you pick (defaults to the buffer's dir)
 --   <leader>sw  grep the word under the cursor / visual selection
@@ -123,17 +124,17 @@ local DIVIDER_STEP = 4 -- columns moved per keypress
 ---Geometry for the three floats. The OUTER size is fixed -- only the divider between
 ---the list and the preview moves.
 local function compute_layout(has_preview)
-  local total_w = math.min(180, math.floor(vim.o.columns * 0.85))
-  local height = math.min(24, math.floor(vim.o.lines * 0.6))
-  local list_w = has_preview and math.floor(total_w * SPLIT_RATIO) or total_w
-  return {
-    total_w = total_w,
-    height = height,
-    list_w = list_w,
-    prev_w = total_w - list_w - 2, -- 2 = the two adjoining borders, no gap between
-    col = math.floor((vim.o.columns - total_w) / 2),
-    row = math.max(1, math.floor((vim.o.lines - height) / 2) - 2),
-  }
+	local total_w = math.min(180, math.floor(vim.o.columns * 0.85))
+	local height = math.min(24, math.floor(vim.o.lines * 0.6))
+	local list_w = has_preview and math.floor(total_w * SPLIT_RATIO) or total_w
+	return {
+		total_w = total_w,
+		height = height,
+		list_w = list_w,
+		prev_w = total_w - list_w - 2, -- 2 = the two adjoining borders, no gap between
+		col = math.floor((vim.o.columns - total_w) / 2),
+		row = math.max(1, math.floor((vim.o.lines - height) / 2) - 2),
+	}
 end
 
 local function root()
@@ -730,8 +731,37 @@ end
 -- Sources
 -- ---------------------------------------------------------------------------
 
-function M.files()
-	local dir = root()
+---Ask for a directory, then call `cb` with its absolute path. Defaults to the current
+---buffer's directory; <Tab> completes directory names. Relative paths resolve against
+---the cwd, and ~ is expanded. Shared by the directory-scoped file and grep pickers.
+---@param label string
+---@param cb fun(dir: string)
+local function prompt_dir(label, cb)
+	local name = vim.api.nvim_buf_get_name(0)
+	local bufdir = name ~= "" and vim.fn.fnamemodify(name, ":p:h") or vim.fn.getcwd()
+	-- :. cannot shorten the cwd itself (it yields the full path), so special-case it. The
+	-- trailing slash lets <Tab> complete straight into subdirectories.
+	local default = bufdir == vim.fn.getcwd() and "./" or vim.fn.fnamemodify(bufdir, ":~:.") .. "/"
+	vim.ui.input({ prompt = label .. " in dir: ", default = default, completion = "dir" }, function(input)
+		input = vim.trim(input or "")
+		if input == "" then
+			return
+		end
+		local dir = vim.fs.normalize(vim.fn.fnamemodify(vim.fn.expand(input), ":p"))
+		-- :p leaves a trailing slash on directories; strip it so the corpus cache key and
+		-- the BufWritePost prefix match the way root() spells paths.
+		dir = dir:gsub("(.)/$", "%1")
+		if vim.fn.isdirectory(dir) == 0 then
+			vim.notify("not a directory: " .. input, vim.log.levels.WARN)
+			return
+		end
+		cb(dir)
+	end)
+end
+
+---@param dir? string defaults to the project root
+function M.files(dir)
+	dir = dir or root()
 	pick({
 		prompt = "Files",
 		items = list_files(dir),
@@ -745,6 +775,13 @@ function M.files()
 			vim.cmd[action](vim.fn.fnameescape(vim.fs.normalize(dir .. "/" .. rel)))
 		end,
 	})
+end
+
+---Find files scoped to a directory asked for up front. Reaches places the project-root
+---picker cannot: the root itself is never pruned, so pointing this at a site-packages
+---or .venv directory lists its contents.
+function M.files_dir()
+	prompt_dir("Files", M.files)
 end
 
 function M.buffers()
@@ -826,28 +863,9 @@ function M.grep()
 	live_grep(nil)
 end
 
----Live grep scoped to one directory, asked for up front. Defaults to the current
----buffer's directory; <Tab> completes directory names. Relative paths resolve against
----the cwd, and ~ is expanded.
+---Live grep scoped to a directory asked for up front.
 function M.grep_dir()
-	local name = vim.api.nvim_buf_get_name(0)
-	local bufdir = name ~= "" and vim.fn.fnamemodify(name, ":p:h") or vim.fn.getcwd()
-	-- :. cannot shorten the cwd itself (it yields the full path), so special-case it. The
-	-- trailing slash lets <Tab> complete straight into subdirectories.
-	local default = bufdir == vim.fn.getcwd() and "./" or vim.fn.fnamemodify(bufdir, ":~:.") .. "/"
-	vim.ui.input({ prompt = "Grep in dir: ", default = default, completion = "dir" }, function(input)
-		input = vim.trim(input or "")
-		if input == "" then
-			return
-		end
-		local dir = vim.fs.normalize(vim.fn.fnamemodify(vim.fn.expand(input), ":p"))
-		-- :p leaves a trailing slash on directories; strip it so the corpus cache key and
-		-- the BufWritePost prefix match the way root() spells paths.
-		dir = dir:gsub("(.)/$", "%1")
-		if vim.fn.isdirectory(dir) == 0 then
-			vim.notify("not a directory: " .. input, vim.log.levels.WARN)
-			return
-		end
+	prompt_dir("Grep", function(dir)
 		live_grep(nil, dir)
 	end)
 end
@@ -1097,9 +1115,14 @@ end
 M.pick = pick
 M.file_preview = file_preview
 
-vim.keymap.set("n", "<leader>sf", M.files, { desc = "[S]earch [F]iles" })
+-- Wrapped: a bare M.files would be fine today, but keeps the keymap from ever passing
+-- an argument into the optional `dir`.
+vim.keymap.set("n", "<leader>sf", function()
+	M.files()
+end, { desc = "[S]earch [F]iles" })
+vim.keymap.set("n", "<leader>sff", M.files_dir, { desc = "[S]earch [FF]iles in a directory" })
 vim.keymap.set("n", "<leader>sg", M.grep, { desc = "[S]earch by [G]rep" })
-vim.keymap.set("n", "<leader>sG", M.grep_dir, { desc = "[S]earch by [G]rep in a directory" })
+vim.keymap.set("n", "<leader>sgg", M.grep_dir, { desc = "[S]earch by [GG]rep in a directory" })
 vim.keymap.set({ "n", "x" }, "<leader>sw", M.grep_word, { desc = "[S]earch current [W]ord" })
 vim.keymap.set("n", "<leader>sb", M.buffers, { desc = "[S]earch [B]uffers" })
 vim.keymap.set("n", "<leader>gs", M.git_files, { desc = "[G]it [S]tatus -- changed files" })
