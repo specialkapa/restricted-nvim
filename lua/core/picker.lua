@@ -9,6 +9,7 @@
 --   <leader>sG  live grep in a directory you pick (defaults to the buffer's dir)
 --   <leader>sw  grep the word under the cursor / visual selection
 --   <leader>sb  switch buffer
+--   <leader>s.  recent files, from anywhere on disk
 --   <leader>/   fuzzy find lines in the current buffer
 
 local uv = vim.uv or vim.loop
@@ -811,6 +812,62 @@ function M.buffers()
 	})
 end
 
+---Recently opened files, most recent first, from anywhere on disk -- not just the project.
+---
+---v:oldfiles is only written to shada on exit, so files opened THIS session are missing
+---from it; those come first, from buffers ordered by last use. The current file is left
+---out, and so is anything that no longer exists (deleted, or a term:// style name).
+function M.oldfiles()
+	local current = vim.fs.normalize(vim.api.nvim_buf_get_name(0))
+	local seen, items = { [current] = true }, {}
+	local function add(path)
+		path = vim.fs.normalize(path)
+		if not seen[path] and vim.fn.filereadable(path) == 1 then
+			seen[path] = true
+			items[#items + 1] = { name = vim.fn.fnamemodify(path, ":~:."), path = path }
+		end
+	end
+
+	local bufs = vim.fn.getbufinfo({ buflisted = 1 })
+	-- lastused has one-second resolution; break ties by buffer number, which only grows.
+	table.sort(bufs, function(a, b)
+		if a.lastused ~= b.lastused then
+			return a.lastused > b.lastused
+		end
+		return a.bufnr > b.bufnr
+	end)
+	for _, b in ipairs(bufs) do
+		if b.name ~= "" then
+			add(b.name)
+		end
+	end
+	for _, path in ipairs(vim.v.oldfiles) do
+		add(path)
+	end
+
+	if #items == 0 then
+		vim.notify("no recent files", vim.log.levels.INFO)
+		return
+	end
+
+	pick({
+		prompt = "Recent files",
+		items = items,
+		format = function(i)
+			return i.name
+		end,
+		preview = function(i)
+			return file_preview(i.path, 1)
+		end,
+		path = function(i)
+			return i.path
+		end,
+		on_choice = function(i, action)
+			vim.cmd[action](vim.fn.fnameescape(i.path))
+		end,
+	})
+end
+
 ---Live grep: the prompt IS the pattern, re-scanned on every keystroke against the
 ---in-memory corpus. Plain substring, case-insensitive.
 local function live_grep(initial, dir)
@@ -1125,6 +1182,7 @@ vim.keymap.set("n", "<leader>sg", M.grep, { desc = "[S]earch by [G]rep" })
 vim.keymap.set("n", "<leader>sgg", M.grep_dir, { desc = "[S]earch by [GG]rep in a directory" })
 vim.keymap.set({ "n", "x" }, "<leader>sw", M.grep_word, { desc = "[S]earch current [W]ord" })
 vim.keymap.set("n", "<leader>sb", M.buffers, { desc = "[S]earch [B]uffers" })
+vim.keymap.set("n", "<leader>s.", M.oldfiles, { desc = "[S]earch recent files ('.' for repeat)" })
 vim.keymap.set("n", "<leader>gs", M.git_files, { desc = "[G]it [S]tatus -- changed files" })
 vim.keymap.set("n", "<leader>g/", M.git_hunks, { desc = "[G]it [H]unks in the current file" })
 vim.keymap.set("n", "<leader>/", M.buffer_lines, { desc = "Fuzzily search in current buffer" })
