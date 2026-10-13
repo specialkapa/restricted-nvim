@@ -28,7 +28,7 @@ vim.fn.sign_define('DapBreakpointRejected', { text = 'R', texthl = 'DiagnosticHi
 vim.fn.sign_define('DapStopped', { text = '>', texthl = 'DiagnosticWarn', linehl = 'Visual' })
 
 M.session = nil -- the running session, if any
-M.last_config = nil -- for <F6> after the program has ended
+M.last_config = nil -- for <leader>dR after the program has ended
 
 -- debugpy's filters. A running adapter's own list replaces this.
 M.exception_filters = {
@@ -563,14 +563,26 @@ end
 -- Starting and stopping
 -- ---------------------------------------------------------------------------
 
----vim.g.dap_python overrides; otherwise the env core.lsp found, else python3 on PATH.
+---vim.g.dap_python overrides; then the active venv / conda env; then python on PATH.
+---Self-contained on purpose: older copies of core.lsp do not export venv_python.
 local function interpreter()
   if vim.g.dap_python then
     return vim.g.dap_python
   end
-  local ok, lsp = pcall(require, 'core.lsp')
-  local py = ok and lsp.venv_python() or nil
-  return py or (vim.fn.exepath 'python3' ~= '' and vim.fn.exepath 'python3') or 'python'
+  for _, var in ipairs { 'VIRTUAL_ENV', 'CONDA_PREFIX' } do
+    local env = vim.env[var]
+    for _, name in ipairs { '/bin/python', '/bin/python3' } do
+      if env and env ~= '' and vim.fn.executable(env .. name) == 1 then
+        return env .. name
+      end
+    end
+  end
+  for _, name in ipairs { 'python', 'python3' } do
+    if vim.fn.exepath(name) ~= '' then
+      return vim.fn.exepath(name)
+    end
+  end
+  return 'python'
 end
 
 local importable = {}
@@ -586,7 +598,7 @@ end
 
 function M.start(config)
   if M.session then
-    return vim.notify('a debug session is already running (<F3> stops it)', WARN)
+    return vim.notify('a debug session is already running (<leader>dq stops it)', WARN)
   end
   local py = interpreter()
   if not has_debugpy(py) then
@@ -685,7 +697,7 @@ function M.terminate()
   if not s then
     return
   end
-  -- A second <F3> (or an adapter without `terminate`) kills the program outright.
+  -- A second <leader>dq (or an adapter without `terminate`) kills the program outright.
   if s.terminating or not s.capabilities.supportsTerminateRequest then
     return request(s, 'disconnect', { terminateDebuggee = true }, function()
       close(s)
@@ -806,6 +818,18 @@ local function browse_breakpoints()
   }
 end
 
+---Plain run in the terminal split; breakpoint() calls still stop, in ipdb.
+local function run_file()
+  local file = buf_path(vim.api.nvim_get_current_buf())
+  if not file then
+    return
+  end
+  if vim.bo.modified then
+    vim.cmd 'write'
+  end
+  require('core.terminal').run(('%s %s'):format(interpreter(), vim.fn.fnameescape(file)), { height = 25 })
+end
+
 local function insert_breakpoint_call()
   local lnum = vim.api.nvim_win_get_cursor(0)[1]
   local line = vim.api.nvim_get_current_line()
@@ -857,15 +881,21 @@ local view = function()
   return require 'core.dapview'
 end
 local map = vim.keymap.set
-map('n', '<F5>', M.continue, { desc = 'Debug: Start/Continue' })
-map('n', '<F6>', M.restart, { desc = 'Debug: Restart' })
-map('n', '<F7>', function()
+-- Same prefixes as core.pydebug: <leader>b* for breakpoints, <leader>d* for running.
+-- Stepping keys follow pdb's commands where they can: n(ext), c(ontinue).
+map('n', '<leader>ds', M.start_file, { desc = '[D]ebug: [S]tart under debugger' })
+map('n', '<leader>dr', run_file, { desc = '[D]ebug: [R]un without the debugger' })
+map('n', '<leader>dc', M.continue, { desc = '[D]ebug: [C]ontinue (or start)' })
+map('n', '<leader>dn', M.step_over, { desc = '[D]ebug: [N]ext line (step over)' })
+map('n', '<leader>di', M.step_into, { desc = '[D]ebug: Step [I]nto' })
+map('n', '<leader>do', M.step_out, { desc = '[D]ebug: Step [O]ut' })
+map('n', '<leader>dt', M.run_to_cursor, { desc = '[D]ebug: Run [T]o cursor' })
+map('n', '<leader>dp', M.pause, { desc = '[D]ebug: [P]ause' })
+map('n', '<leader>dq', M.terminate, { desc = '[D]ebug: [Q]uit (twice kills)' })
+map('n', '<leader>dR', M.restart, { desc = '[D]ebug: [R]estart' })
+map('n', '<leader>dv', function()
   view().toggle()
-end, { desc = 'Debug: Toggle the debug panel' })
-map('n', '<F1>', M.step_into, { desc = 'Debug: Step Into' })
-map('n', '<F2>', M.step_out, { desc = 'Debug: Step Out' })
-map('n', '<F3>', M.terminate, { desc = 'Debug: Terminate' })
-map('n', '<F10>', M.step_over, { desc = 'Debug: Step Over' })
+end, { desc = '[D]ebug: Toggle the [V]iew panel' })
 map('n', '<leader>b', function()
   M.toggle_breakpoint()
 end, { desc = 'Debug: Toggle [B]reakpoint' })
@@ -885,8 +915,7 @@ map('n', '<leader>bl', function()
 end, { desc = 'Debug: [L]og point' })
 map('n', '<leader>bb', browse_breakpoints, { desc = 'Debug: [B]rowse [B]reakpoints' })
 map('n', '<leader>bi', insert_breakpoint_call, { desc = 'Debug: [I]nsert breakpoint() call' })
-map('n', '<leader>rb', M.clear_breakpoints, { desc = 'Debug: [R]emove all [B]reakpoints' })
-map('n', '<leader>gt', M.run_to_cursor, { desc = 'Debug: [G]o [T]o cursor' })
+map('n', '<leader>bc', M.clear_breakpoints, { desc = 'Debug: [C]lear all [B]reakpoints' })
 map({ 'n', 'x' }, '<leader>dw', function()
   view().add_watch()
 end, { desc = 'Debug: Add to [W]atch list' })

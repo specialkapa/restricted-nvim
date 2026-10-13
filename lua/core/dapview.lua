@@ -165,7 +165,7 @@ end
 local function not_stopped(b)
   local s = dap.session
   if not s then
-    note(b, 'No debug session. <F5> debugs the current file.')
+    note(b, 'No debug session. <leader>ds debugs the current file.')
   elseif not s.stopped then
     note(b, 'Running... (:DapPause to break in)')
   else
@@ -369,7 +369,7 @@ local function winbar()
   return table.concat(parts)
     .. '%#TabLineFill#%<%=%#Comment# '
     .. state:gsub('%%', '%%%%')
-    .. '  F5 continue  F10 over  F1 in  F2 out  F3 stop '
+    .. '  <leader>d + c continue  n next  i into  o out  q quit '
 end
 
 local function open_term_win()
