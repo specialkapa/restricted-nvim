@@ -24,6 +24,8 @@
 --   <leader>jc  clear the cell's output   <leader>jC  clear all output
 --   <leader>jb  new code cell below    <leader>jm  new markdown cell below
 --   ]j / [j     next / previous cell
+--   <C-CR>      run cell, <S-CR> run and move on -- in insert mode too, if the terminal
+--               sends those keys (see keymaps)
 --   zc / zo     fold / unfold a cell; zM folds them all into an outline, zR opens all
 --
 -- Pause after <leader>j and a legend of all of the above pops up (see M.legend).
@@ -376,16 +378,42 @@ end
 -- Each cell is drawn as an open-right box, all of it virtual -- the buffer text is
 -- untouched:
 --
---   ╭─ [3] ─ cell 4/12 ──────────    over the '# %%' line (shown as-is while the cursor
---   │ df = spark.read.parquet(p)     is on it, so it can still be edited)
---   │ df.count()                     inline, shifting the code two columns right
---   ├─ out 2.1s ─────────────────    virtual lines under the cell's last line
---   │ 1204
---   ╰────────────────────────────
+--   ▁▁ [3] · cell 4/12 ▁▁▁▁▁▁▁▁▁▁    over the '# %%' line (shown as-is while the cursor
+--   ▎ df = spark.read.parquet(p)     is on it, so it can still be edited)
+--   ▎ df.count()                     inline, shifting the code two columns right
+--   ▎ out · 2.1s                     virtual lines under the cell's last line
+--   ▎ 1204
+--   ▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔
+--
+-- Block elements, not box-drawing lines: many fonts draw '─' narrower than its cell, so a
+-- run of them comes out dashed, while terminals draw block elements edge to edge. ▁ sits
+-- at the bottom of the header row and ▔ at the top of the row below the cell, so the two
+-- rules hug the code. All plain Unicode, no patched font.
+--
+-- Written as \u{} escapes, like tabline.lua and lualine.lua: the file then stays pure
+-- ASCII, so no copy or editor along the way can mangle the characters into '?'.
 --
 -- No right edge: lines longer than the window would break it. The rules are simply
 -- longer than any window and get cut off at its edge.
-local RULE = ('─'):rep(300)
+local LOWER = '\u{2581}' -- ▁ lower one-eighth block
+local UPPER = '\u{2594}' -- ▔ upper one-eighth block
+local DOT = '\u{00B7}' -- · middle dot
+local TOP = LOWER:rep(300)
+local BOTTOM = UPPER:rep(300)
+local BAR = '\u{258E} ' -- ▎ left one-quarter block
+local SEP = ' ' .. DOT .. ' '
+
+---The start of a header, up to where foldtext's preview begins. render() and foldtext()
+---must draw exactly the same chunks, or a closed fold shows the overlay through it.
+local function header_prefix(border, label, i, n)
+  return {
+    { LOWER:rep(2) .. ' ', border },
+    { label, 'NotebookLabel' },
+    { SEP, border },
+    { ('cell %d/%d'):format(i, n), 'NotebookCellNumber' },
+    { ' ', border },
+  }
+end
 
 local function header_label(c, d)
   if c.type ~= 'code' then
@@ -471,18 +499,12 @@ local function render(buf)
       last = cursor
     end
 
-    -- The top rule is two pieces. An overlay draws over closed folds too, so it holds only
+    -- The header is two pieces. An overlay draws over closed folds too, so it holds only
     -- the prefix, which foldtext() repeats exactly; the rest of the rule is end-of-line
     -- text, which a closed fold hides -- letting foldtext's preview show through.
-    local prefix = {
-      { '╭─ ', border },
-      { label, 'NotebookLabel' },
-      { ' ─ ', border },
-      { ('cell %d/%d'):format(i, #list), 'NotebookCellNumber' },
-      { ' ', border },
-    }
+    local prefix = header_prefix(border, label, i, #list)
     if not c.row then
-      mark(0, { virt_lines = { vim.list_extend(prefix, { { RULE, border } }) }, virt_lines_above = true })
+      mark(0, { virt_lines = { vim.list_extend(prefix, { { TOP, border } }) }, virt_lines_above = true })
     else
       if cursor ~= c.row + 1 then
         -- Past the end of '# %%' the two pieces overlap. The highest priority is drawn
@@ -490,12 +512,12 @@ local function render(buf)
         -- headers the rule wipes out the label.
         mark(c.row, { virt_text = prefix, virt_text_pos = 'overlay', priority = 5000 })
       end
-      mark(c.row, { virt_text = { { RULE, border } }, virt_text_pos = 'eol' })
+      mark(c.row, { virt_text = { { TOP, border } }, virt_text_pos = 'eol' })
     end
 
     -- right_gravity = false keeps the bar left of anything typed at the start of a line.
     for r = c.s, last do
-      mark(r - 1, { virt_text = { { '│ ', border } }, virt_text_pos = 'inline', right_gravity = false })
+      mark(r - 1, { virt_text = { { BAR, border } }, virt_text_pos = 'inline', right_gravity = false })
     end
 
     local virt = {}
@@ -504,7 +526,7 @@ local function render(buf)
       out_label, out_hl = output_label(d)
     end
     if out_label then
-      virt[1] = { { '├─ ', border }, { out_label, out_hl }, { ' ' .. RULE, border } }
+      virt[1] = { { BAR, border }, { out_label, out_hl } }
       local entries = {}
       for _, o in ipairs(d.outputs) do
         vim.list_extend(entries, output_entries(o, false))
@@ -515,14 +537,14 @@ local function render(buf)
         entries[#entries + 1] = { ('... %d more lines  <leader>jo to view'):format(hidden), 'NotebookStatus' }
       end
       for _, e in ipairs(entries) do
-        virt[#virt + 1] = { { '│ ', border }, { e[1], e[2] } }
+        virt[#virt + 1] = { { BAR, border }, { e[1], e[2] } }
       end
-      virt[#virt + 1] = { { '╰' .. RULE, border } }
+      virt[#virt + 1] = { { BOTTOM, border } }
     elseif d and c.type == 'code' and d.elapsed then
       -- Ran, printed nothing: the timing goes on the bottom rule.
-      virt[1] = { { '╰─ ', border }, { 'ok' .. elapsed(d), 'NotebookStatus' }, { ' ' .. RULE, border } }
+      virt[1] = { { UPPER:rep(2) .. ' ', border }, { 'ok' .. elapsed(d), 'NotebookStatus' }, { ' ' .. BOTTOM, border } }
     else
-      virt[1] = { { '╰' .. RULE, border } }
+      virt[1] = { { BOTTOM, border } }
     end
     mark(last >= c.s and last - 1 or c.row or 0, { virt_lines = virt })
 
@@ -557,16 +579,12 @@ function M.foldtext()
     end
   end
   local n = math.max(body_end - start, 0)
-  return {
-    { '╭─ ', 'NotebookBorder' },
-    { c and c.label or '# %%', 'NotebookLabel' },
-    { ' ─ ', 'NotebookBorder' },
-    { ('cell %d/%d'):format(idx, #layout), 'NotebookCellNumber' },
-    { ' ─ ', 'NotebookBorder' }, -- render() overlays everything up to here, identically
+  return vim.list_extend(header_prefix('NotebookBorder', c and c.label or '# %%', idx, #layout), {
+    { DOT .. ' ', 'NotebookBorder' },
     { preview, 'Normal' },
-    { (' ─ %d line%s '):format(n, n == 1 and '' or 's'), 'NotebookCellNumber' },
-    { RULE, 'NotebookBorder' },
-  }
+    { (' %s %d line%s '):format(DOT, n, n == 1 and '' or 's'), 'NotebookCellNumber' },
+    { TOP, 'NotebookBorder' },
+  })
 end
 
 local function window_options()
@@ -951,6 +969,8 @@ local ACTIONS = {
 
 -- Shown in the legend for reference; these are plain mappings or built-in commands.
 local OTHER_KEYS = {
+  { '<C-CR>', 'run cell (insert mode too)' },
+  { '<S-CR>', 'run cell, go to next' },
   { ']j [j', 'next / previous cell' },
   { 'zc zo', 'fold / open a cell' },
   { 'zM zR', 'fold all (outline) / open all' },
@@ -999,7 +1019,8 @@ function M.legend()
     width = width,
     height = #lines,
     style = 'minimal',
-    border = 'rounded',
+    -- Block elements rather than 'rounded' (box-drawing, dashed in many fonts).
+    border = { LOWER, LOWER, LOWER, '\u{2595}', UPPER, UPPER, UPPER, '\u{258F}' }, -- ▕ ▏
     title = ' <leader>j ',
     title_pos = 'center',
     noautocmd = true,
@@ -1029,6 +1050,15 @@ local function keymaps(buf)
     map('<leader>j' .. a[1], a[3], a[2])
   end
   map('<leader>j', M.legend, 'show the notebook keymaps')
+  -- Jupyter's own keys, in insert mode as well so running never means leaving it. Only
+  -- reaches Neovim if the terminal sends Ctrl/Shift+Enter as distinct keys (kitty keyboard
+  -- protocol, or xterm's modifyOtherKeys); many send a plain <CR>. Check with <C-v> then
+  -- Ctrl+Enter in insert mode: it should insert <C-CR>, not start a new line.
+  local both = function(lhs, fn, desc)
+    vim.keymap.set({ 'n', 'i' }, lhs, fn, { buffer = buf, desc = 'Notebook: ' .. desc })
+  end
+  both('<C-CR>', function() M.run_cell(false) end, 'run cell')
+  both('<S-CR>', function() M.run_cell(true) end, 'run cell and move to the next')
   map(']j', function() M.jump(1) end, 'next cell')
   map('[j', function() M.jump(-1) end, 'previous cell')
 end
