@@ -174,12 +174,13 @@ vim.api.nvim_create_autocmd('LspAttach', {
     -- Native completion (0.11+). On older builds vim.lsp.start has already set
     -- 'omnifunc', so <C-x><C-o> works regardless.
     -- Only for servers that complete: vim.lsp.completion.get() waits for a reply from
-    -- every enabled client, so enabling ruff here leaves bare-word completion hanging.
+    -- every client enabled here, and ruff has no completion.
     if vim.lsp.completion and vim.lsp.completion.enable and client.server_capabilities.completionProvider then
       pcall(vim.lsp.completion.enable, true, client.id, args.buf, { autotrigger = true })
     end
     if client.server_capabilities.completionProvider then
       require('core.completion').attach_border(args.buf)
+      require('core.completion').attach_autotrigger(args.buf)
     end
 
     local map = function(keys, fn, desc)
@@ -203,6 +204,13 @@ vim.api.nvim_create_autocmd('LspAttach', {
         apply = true,
       }
     end, 'Ruff organize imports')
+    -- Off by default (Neovim's own default); this only toggles them for the buffer.
+    if client.server_capabilities.inlayHintProvider then
+      map('<leader>th', function()
+        local on = vim.lsp.inlay_hint.is_enabled { bufnr = args.buf }
+        vim.lsp.inlay_hint.enable(not on, { bufnr = args.buf })
+      end, 'Toggle inlay hints')
+    end
   end,
 })
 

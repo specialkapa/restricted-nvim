@@ -101,43 +101,34 @@ end
 -- the menu. nvim-cmp triggered on any keyword character; this restores that. It doubles
 -- as the autotrigger for Neovim < 0.11, where 'omnifunc' is the only route.
 --
+-- Buffer-local, attached from LspAttach (core/lsp.lua) for servers that complete. A global
+-- augroup made here vanished after startup on the restricted machine; buffer-local
+-- autocmds made at attach time survive. It feeds <C-x><C-o> (the omnifunc, which only
+-- asks completion-capable servers), the route proven to work there.
+--
 -- Once the menu is open Neovim filters it natively as you keep typing, so this fires at
 -- most once per word rather than on every keystroke.
 -- ---------------------------------------------------------------------------
 
-local function trigger()
-  if has_native then
-    vim.lsp.completion.get()
-  else
-    feed '<C-x><C-o>'
+M.attach_autotrigger = function(buf)
+  if vim.b[buf].kw_autotrigger then
+    return
   end
-end
-
-vim.api.nvim_create_autocmd('TextChangedI', {
-  group = vim.api.nvim_create_augroup('completion-autotrigger', { clear = true }),
-  callback = function(args)
-    if vim.fn.pumvisible() == 1 or vim.fn.mode() ~= 'i' then
-      return
-    end
-    local clients = vim.lsp.get_clients and vim.lsp.get_clients { bufnr = args.buf } or vim.lsp.buf_get_clients(args.buf)
-    local can_complete = false
-    for _, c in ipairs(clients) do
-      if c.server_capabilities and c.server_capabilities.completionProvider then
-        can_complete = true
-        break
+  vim.b[buf].kw_autotrigger = true
+  vim.api.nvim_create_autocmd('TextChangedI', {
+    buffer = buf,
+    callback = function()
+      if vim.fn.pumvisible() == 1 or vim.fn.mode() ~= 'i' then
+        return
       end
-    end
-    if not can_complete then
-      return
-    end
-
-    local col = vim.fn.col '.' - 1
-    local before = vim.api.nvim_get_current_line():sub(1, col)
-    if before:match '[%w_][%w_]$' or before:match '%.$' then
-      trigger()
-    end
-  end,
-})
+      local before = vim.api.nvim_get_current_line():sub(1, vim.fn.col '.' - 1)
+      -- `.` is left to the native autotrigger when there is one.
+      if before:match '[%w_][%w_]$' or (not has_native and before:match '%.$') then
+        feed '<C-x><C-o>'
+      end
+    end,
+  })
+end
 
 -- ---------------------------------------------------------------------------
 -- Menu border, matching the picker floats (BORDER and PickerBorder in core/picker.lua).

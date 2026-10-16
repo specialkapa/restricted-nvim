@@ -22,6 +22,9 @@
 --   <leader>ja  run all cells          <leader>jA  run all cells up to this one
 --   <leader>ji  interrupt the kernel   <leader>jR  restart it
 --   <leader>jo  the cell's full output in a float; <CR> on an image opens it externally
+--   <leader>jv  inspect the variable under the cursor in the kernel (or, in visual mode,
+--               the selected expression): shape, dtypes, nulls and head() for DataFrames,
+--               stats for arrays, signature and docstring for functions -- see INSPECT
 --   <leader>jc  clear the cell's output   <leader>jC  clear all output
 --   <leader>jb  new code cell below    <leader>jm  new markdown cell below
 --   ]j / [j     next / previous cell
@@ -728,6 +731,13 @@ local function on_event(buf, k, ev)
     if vim.api.nvim_buf_is_valid(buf) then
       vim.bo[buf].modified = true -- outputs changed; ZZ must not drop them silently
     end
+  elseif ev.ev == 'inspect' then
+    local req = k.inspects[ev.id]
+    k.inspects[ev.id] = nil
+    if req then
+      M.show_inspect(req.expr, ev)
+    end
+    return
   elseif ev.ev == 'dead' then
     abort_pending(k, 'the kernel died')
     vim.notify('notebook: the kernel died -- <leader>jR restarts it, :NotebookLog says why', vim.log.levels.ERROR)
@@ -751,7 +761,8 @@ local function start(buf)
     return nil
   end
   local cwd = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ':p:h')
-  local k = { reqs = {}, seq = 0, partial = '', stderr = {} }
+  -- reqs: cells awaiting the kernel; inspects: <leader>jv requests, keyed the same way.
+  local k = { reqs = {}, inspects = {}, seq = 0, partial = '', stderr = {} }
 
   k.job = vim.fn.jobstart({ py, bridge_path(), cwd, log_path() }, {
     cwd = cwd,
@@ -932,34 +943,14 @@ function M.new_cell(type)
   vim.cmd('startinsert!')
 end
 
----Every output of the cell under the cursor, untruncated, in a floating window.
-function M.show_output()
-  local buf = vim.api.nvim_get_current_buf()
-  local c = cell_at(scan(buf), vim.api.nvim_win_get_cursor(0)[1])
-  local d = c and c.data
-  if not d or (#d.outputs == 0 and not d.status) then
-    vim.notify('notebook: this cell has no output', vim.log.levels.INFO)
-    return
-  end
-  local lines, images = {}, {}
-  for _, o in ipairs(d.outputs) do
-    for _, e in ipairs(output_entries(o, true)) do
-      lines[#lines + 1] = e[1]
-      local mime = e[1]:match('^%[(image/[%w%.%+%-]+)%]')
-      if mime then
-        images[#lines] = { mime = mime, data = join(o.data[mime]) }
-      end
-    end
-  end
-
+---A centred float, sized to `lines` but never more than most of the editor. Like any
+---popup it closes on q, <Esc>, or as soon as focus moves elsewhere.
+local function popup(lines, title, footer)
   local out = vim.api.nvim_create_buf(false, true)
   vim.bo[out].bufhidden = 'wipe'
   vim.api.nvim_buf_set_lines(out, 0, -1, false, lines)
   vim.bo[out].modifiable = false
 
-  -- A centred float, sized to the output but never more than most of the editor.
-  local title = ' output ' .. DOT .. ' ' .. status_line(d) .. ' '
-  local footer = next(images) and ' <CR> open image ' .. DOT .. ' q close ' or ' q close '
   local width = math.max(vim.fn.strdisplaywidth(title), vim.fn.strdisplaywidth(footer)) + 4
   for _, l in ipairs(lines) do
     width = math.max(width, vim.fn.strdisplaywidth(l) + 1)
@@ -982,7 +973,6 @@ function M.show_output()
   vim.wo[win].winhighlight = 'NormalFloat:Normal,FloatBorder:NotebookBorderActive,FloatTitle:NotebookLabel,FloatFooter:NotebookStatus'
   vim.wo[win].wrap = false
   vim.wo[win].cursorline = true
-  -- Like any popup: gone as soon as focus moves elsewhere.
   vim.api.nvim_create_autocmd('WinLeave', {
     buffer = out,
     once = true,
@@ -993,6 +983,32 @@ function M.show_output()
   for _, key in ipairs({ 'q', '<Esc>' }) do
     vim.keymap.set('n', key, '<Cmd>close<CR>', { buffer = out, nowait = true })
   end
+  return out, win
+end
+
+---Every output of the cell under the cursor, untruncated, in a floating window.
+function M.show_output()
+  local buf = vim.api.nvim_get_current_buf()
+  local c = cell_at(scan(buf), vim.api.nvim_win_get_cursor(0)[1])
+  local d = c and c.data
+  if not d or (#d.outputs == 0 and not d.status) then
+    vim.notify('notebook: this cell has no output', vim.log.levels.INFO)
+    return
+  end
+  local lines, images = {}, {}
+  for _, o in ipairs(d.outputs) do
+    for _, e in ipairs(output_entries(o, true)) do
+      lines[#lines + 1] = e[1]
+      local mime = e[1]:match('^%[(image/[%w%.%+%-]+)%]')
+      if mime then
+        images[#lines] = { mime = mime, data = join(o.data[mime]) }
+      end
+    end
+  end
+
+  local title = ' output ' .. DOT .. ' ' .. status_line(d) .. ' '
+  local footer = next(images) and ' <CR> open image ' .. DOT .. ' q close ' or ' q close '
+  local out = popup(lines, title, footer)
   vim.keymap.set('n', '<CR>', function()
     local img = images[vim.api.nvim_win_get_cursor(0)[1]]
     if not img then
@@ -1008,6 +1024,52 @@ function M.show_output()
   end, { buffer = out })
 end
 
+---Summarise a value in the running kernel: the expression under the cursor (`df`,
+---`df.col`), or with `visual` the selection, for anything else (`df[df.x > 0]`).
+---The kernel evaluates it silently -- no execution count, no `_`/Out, nothing added to
+---the namespace -- and the reply arrives as an 'inspect' event (M.show_inspect).
+function M.inspect(visual)
+  local buf = vim.api.nvim_get_current_buf()
+  local k = books[buf] and books[buf].kernel
+  if not k then
+    vim.notify('notebook: no kernel running -- run a cell first', vim.log.levels.WARN)
+    return
+  end
+  local expr
+  if visual then
+    expr = table.concat(vim.fn.getregion(vim.fn.getpos('v'), vim.fn.getpos('.'), { type = vim.fn.mode() }), '\n')
+    vim.api.nvim_feedkeys(vim.keycode('<Esc>'), 'nx', false)
+  else
+    expr = vim.fn.expand('<cexpr>')
+  end
+  expr = vim.trim(expr)
+  if expr == '' then
+    vim.notify('notebook: no expression under the cursor', vim.log.levels.INFO)
+    return
+  end
+  k.seq = k.seq + 1
+  k.inspects[k.seq] = { expr = expr }
+  send(k, { op = 'inspect', id = k.seq, expr = expr })
+  -- The kernel answers requests in order, so this waits for any cell still running.
+  if next(k.reqs) then
+    vim.notify('notebook: kernel busy -- inspecting ' .. expr .. ' once the queued cells finish')
+  end
+end
+
+function M.show_inspect(expr, ev)
+  if ev.error then
+    vim.notify('notebook: ' .. expr .. ' -- ' .. ev.error, vim.log.levels.WARN)
+    return
+  end
+  local lines = display_lines(ev.text or '')
+  -- First line of the summary is the type: it goes in the title next to the expression.
+  local kind = table.remove(lines, 1) or ''
+  if lines[1] == '' then
+    table.remove(lines, 1)
+  end
+  popup(lines, ' ' .. expr .. ' ' .. DOT .. ' ' .. kind .. ' ', ' q close ')
+end
+
 -- ---------------------------------------------------------------------------
 -- Reading and writing .ipynb
 
@@ -1021,6 +1083,7 @@ local ACTIONS = {
   { 'i', 'interrupt kernel', op('interrupt', 'interrupt sent') },
   { 'R', 'restart kernel', op('restart', 'restarting kernel...') },
   { 'o', 'full output in float', function() M.show_output() end },
+  { 'v', 'inspect variable', function() M.inspect(false) end },
   { 'c', 'clear cell output', function() M.clear(false) end },
   { 'C', 'clear all output', function() M.clear(true) end },
   { 'b', 'new code cell below', function() M.new_cell('code') end },
@@ -1109,6 +1172,7 @@ local function keymaps(buf)
     map('<leader>j' .. a[1], a[3], a[2])
   end
   map('<leader>j', M.legend, 'show the notebook keymaps')
+  vim.keymap.set('x', '<leader>jv', function() M.inspect(true) end, { buffer = buf, desc = 'Notebook: inspect selection' })
   -- Jupyter's own keys, in insert mode as well so running never means leaving it. Only
   -- reaches Neovim if the terminal sends Ctrl/Shift+Enter as distinct keys (kitty keyboard
   -- protocol, or xterm's modifyOtherKeys); many send a plain <CR>. Check with <C-v> then
@@ -1332,12 +1396,14 @@ end, { desc = 'Shut down this notebook kernel' })
 -- The helper, written to stdpath('cache') and run with the environment's python.
 -- JSON lines in both directions:
 --
---   nvim -> helper  {op = execute, id, code} | {op = interrupt} | {op = restart} | {op = shutdown}
+--   nvim -> helper  {op = execute, id, code} | {op = inspect, id, expr} | {op = interrupt}
+--                   {op = restart} | {op = shutdown}
 --   helper -> nvim  {ev = ready, python} | {ev = start, id, count} | {ev = output, id, output}
 --                   {ev = clear, id, wait} | {ev = done, id, status} | {ev = dead}
---                   {ev = restarted} | {ev = fatal, msg}
+--                   {ev = inspect, id, text | error} | {ev = restarted} | {ev = fatal, msg}
 
 BRIDGE = [==[
+import ast
 import json
 import queue
 import signal
@@ -1361,6 +1427,187 @@ def read_stdin(q):
         except ValueError:
             pass
     q.put(None)
+
+
+# <leader>jv's summariser. It runs inside the kernel as a module of its own,
+# sys.modules["_nvim_inspect"], so nothing appears in the user's namespace. Third-party
+# types are checked through sys.modules: inspecting never imports pandas & co itself.
+# The first line returned is the type, which Neovim puts in the float's title.
+INSPECT = r"""
+import inspect
+import reprlib
+import sys
+
+ROWS = 10       # head() rows
+COLS = 200      # columns listed in a dtype table
+CLIP = 4000     # characters of a plain repr
+
+_r = reprlib.Repr()
+_r.maxstring = _r.maxother = 80
+
+
+def _clip(s, limit=CLIP):
+    s = str(s)
+    return s if len(s) <= limit else s[:limit] + " ..."
+
+
+def _type_name(t):
+    m = t.__module__
+    return t.__qualname__ if m == "builtins" else m + "." + t.__qualname__
+
+
+def _table(pairs, heads):
+    pairs = list(pairs)
+    shown = pairs[:COLS]
+    w = [max([len(h)] + [len(str(p[i])) for p in shown]) for i, h in enumerate(heads)]
+    out = ["  ".join(h.ljust(w[i]) for i, h in enumerate(heads)).rstrip()]
+    out += ["  ".join(str(c).ljust(w[i]) for i, c in enumerate(p)).rstrip() for p in shown]
+    if len(pairs) > COLS:
+        out.append("... %d more" % (len(pairs) - COLS))
+    return out
+
+
+def _isinstance(v, module, name):
+    m = sys.modules.get(module)
+    t = getattr(m, name, None) if m else None
+    return isinstance(t, type) and isinstance(v, t)
+
+
+def _pandas_frame(v, out):
+    rows, cols = v.shape
+    mem = v.memory_usage(index=True, deep=False).sum() / 2**20
+    out.append("shape %s x %s   memory %.1f MiB (shallow)" % (f"{rows:,}", f"{cols:,}", mem))
+    out.append("index %s  %s" % (type(v.index).__name__, _r.repr(list(v.index[:3]))))
+    out.append("")
+    nn = v.notna().sum()
+    out += _table(((c, dt, f"{nn.iloc[i]:,}") for i, (c, dt) in enumerate(v.dtypes.items())),
+                  ("column", "dtype", "non-null"))
+    out.append("")
+    out += v.head(ROWS).to_string(max_cols=30, max_colwidth=40).splitlines()
+
+
+def _pandas_series(v, out):
+    out.append("name %r   dtype %s   length %s   nulls %s"
+               % (v.name, v.dtype, f"{len(v):,}", f"{int(v.isna().sum()):,}"))
+    if len(v):
+        out.append("")
+        out += v.describe().to_string().splitlines()
+    out.append("")
+    out += v.head(ROWS).to_string().splitlines()
+
+
+def _numpy(v, out):
+    import numpy as np
+    out.append("shape %s   dtype %s   size %s   %.1f MiB" % (v.shape, v.dtype, f"{v.size:,}", v.nbytes / 2**20))
+    if v.size and np.issubdtype(v.dtype, np.number) and not np.issubdtype(v.dtype, np.complexfloating):
+        with np.errstate(all="ignore"):
+            nan = int(np.isnan(v).sum()) if np.issubdtype(v.dtype, np.floating) else 0
+            out.append("min %s   max %s   mean %s   nan %s" % (np.nanmin(v), np.nanmax(v), np.nanmean(v), f"{nan:,}"))
+    out.append("")
+    out += np.array2string(v, threshold=200, edgeitems=3, max_line_width=120).splitlines()
+
+
+def _polars_frame(v, out):
+    out.append("shape %s x %s   estimated %.1f MiB" % (f"{v.shape[0]:,}", f"{v.shape[1]:,}", v.estimated_size("mb")))
+    out.append("")
+    out += _table(v.schema.items(), ("column", "dtype"))
+    out.append("")
+    out += str(v.head(ROWS)).splitlines()
+
+
+def _spark_frame(v, out):
+    # No count() or show(): either would run a Spark job.
+    out.append("%d columns (rows not counted: that would run a Spark job)" % len(v.columns))
+    out.append("")
+    out += _table(v.dtypes, ("column", "dtype"))
+
+
+def _callable(v, out):
+    try:
+        out.append("%s%s" % (getattr(v, "__name__", ""), inspect.signature(v)))
+    except (TypeError, ValueError):
+        pass
+    try:
+        out.append("defined in %s:%d" % (inspect.getsourcefile(v), inspect.getsourcelines(v)[1]))
+    except (TypeError, OSError):
+        pass
+    doc = inspect.getdoc(v)
+    if doc:
+        out.append("")
+        out += doc.splitlines()[:40]
+
+
+def _container(v, out):
+    out.append("length %s" % f"{len(v):,}")
+    out.append("")
+    items = list(v.items()) if isinstance(v, dict) else list(enumerate(v)) if isinstance(v, (list, tuple)) else None
+    if items is None:  # sets: no order worth showing
+        out.append(_clip(_r.repr(v)))
+        return
+    for k, x in items[:30]:
+        out.append("%s: %s  %s" % (_r.repr(k), type(x).__name__, _r.repr(x)))
+    if len(items) > 30:
+        out.append("... %d more" % (len(items) - 30))
+
+
+def summary(v):
+    out = [_type_name(type(v)), ""]
+    try:
+        if _isinstance(v, "pandas", "DataFrame"):
+            _pandas_frame(v, out)
+        elif _isinstance(v, "pandas", "Series"):
+            _pandas_series(v, out)
+        elif _isinstance(v, "numpy", "ndarray"):
+            _numpy(v, out)
+        elif _isinstance(v, "polars", "DataFrame"):
+            _polars_frame(v, out)
+        elif _isinstance(v, "pyspark.sql", "DataFrame") or _isinstance(v, "pyspark.sql.connect.dataframe", "DataFrame"):
+            _spark_frame(v, out)
+        elif inspect.isroutine(v) or inspect.isclass(v):
+            _callable(v, out)
+        elif inspect.ismodule(v):
+            out.append("file %s" % getattr(v, "__file__", "(built-in)"))
+            doc = inspect.getdoc(v)
+            if doc:
+                out += [""] + doc.splitlines()[:20]
+        elif isinstance(v, (str, bytes)):
+            out += ["length %s" % f"{len(v):,}", ""] + _clip(v if isinstance(v, str) else repr(v)).splitlines()
+        elif isinstance(v, (dict, list, tuple, set, frozenset)):
+            _container(v, out)
+        else:
+            out += _clip(repr(v)).splitlines()
+    except Exception as e:
+        out.append("(summary failed: %s: %s)" % (type(e).__name__, e))
+    return "\n".join(out)
+"""
+
+# Runs (silently) before each inspect's user expression: installs the module above once
+# per kernel, again after a restart. An expression statement, so it binds no names.
+INSPECT_SETUP = (
+    "getattr(__import__('sys').modules.get('_nvim_inspect'), 'summary', None) or exec("
+    + repr(INSPECT)
+    + ", __import__('sys').modules.setdefault('_nvim_inspect',"
+    " __import__('types').ModuleType('_nvim_inspect')).__dict__)"
+)
+
+
+def inspect_result(content):
+    """The text (or error) of an inspect, from its execute_reply."""
+    if content.get("status") == "aborted":
+        return {"error": "not run: an earlier cell failed"}
+    r = content.get("user_expressions", {}).get("r")
+    if content.get("status") != "ok" or r is None:
+        return {"error": "%s: %s" % (content.get("ename", "error"), content.get("evalue", ""))}
+    if r.get("status") != "ok":
+        return {"error": "%s: %s" % (r.get("ename", "error"), r.get("evalue", ""))}
+    # The value is a str, so text/plain is its repr -- possibly pretty-printed as several
+    # adjacent literals in parentheses, which literal_eval still reads back.
+    text = r.get("data", {}).get("text/plain", "")
+    try:
+        text = ast.literal_eval(text)
+    except (ValueError, SyntaxError):
+        pass
+    return {"text": text}
 
 
 def on_term(*_):
@@ -1391,6 +1638,7 @@ def main():
     km = KernelManager(kernel_spec_manager=Spec(), kernel_name="nvim")
     kc = None
     pending = {}  # msg_id -> {"id": nvim's id, "idle": bool, "status": reply status}
+    inspects = {}  # msg_id -> nvim's id; answered by the shell reply alone
 
     def finish(msg_id):
         p = pending.pop(msg_id)
@@ -1423,10 +1671,20 @@ def main():
                     if op == "execute":
                         msg_id = kc.execute(cmd["code"], allow_stdin=False)
                         pending[msg_id] = {"id": cmd["id"], "idle": False, "status": None}
+                    elif op == "inspect":
+                        # user_expressions are evaluated after the code, in the user's
+                        # namespace; silent keeps this out of history, _ and Out. The
+                        # newline lets a trailing comment in the selection end harmlessly.
+                        expr = "__import__('_nvim_inspect').summary((" + cmd["expr"] + "\n))"
+                        msg_id = kc.execute(INSPECT_SETUP, silent=True, store_history=False,
+                                            user_expressions={"r": expr}, allow_stdin=False,
+                                            stop_on_error=False)
+                        inspects[msg_id] = cmd["id"]
                     elif op == "interrupt":
                         km.interrupt_kernel()
                     elif op == "restart":
                         pending.clear()
+                        inspects.clear()
                         km.restart_kernel(now=False)
                         kc.wait_for_ready(timeout=120)
                         alive = True
@@ -1442,6 +1700,9 @@ def main():
                 while True:
                     reply = kc.get_shell_msg(timeout=0)
                     msg_id = reply["parent_header"].get("msg_id")
+                    if msg_id in inspects:
+                        emit(ev="inspect", id=inspects.pop(msg_id), **inspect_result(reply["content"]))
+                        continue
                     p = pending.get(msg_id)
                     if p is not None:
                         p["status"] = reply["content"].get("status", "ok")
@@ -1484,6 +1745,7 @@ def main():
             if alive and not km.is_alive():
                 alive = False
                 pending.clear()
+                inspects.clear()
                 emit(ev="dead")
     finally:
         if km.has_kernel:
