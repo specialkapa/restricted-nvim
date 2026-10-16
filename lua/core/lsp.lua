@@ -178,6 +178,9 @@ vim.api.nvim_create_autocmd('LspAttach', {
     if vim.lsp.completion and vim.lsp.completion.enable and client.server_capabilities.completionProvider then
       pcall(vim.lsp.completion.enable, true, client.id, args.buf, { autotrigger = true })
     end
+    if client.server_capabilities.completionProvider then
+      require('core.completion').attach_border(args.buf)
+    end
 
     local map = function(keys, fn, desc)
       vim.keymap.set('n', keys, fn, { buffer = args.buf, desc = 'LSP: ' .. desc })

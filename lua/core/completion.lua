@@ -6,6 +6,10 @@
 --
 -- Keymaps mirror the nvim-cmp setup on the main machine so muscle memory carries across.
 
+local M = {
+  attach_border = function() end,
+}
+
 local has_native = vim.lsp.completion ~= nil and vim.lsp.completion.enable ~= nil
 
 -- Matches cmp's `completion = { completeopt = 'menu,menuone,noinsert' }`.
@@ -134,3 +138,104 @@ vim.api.nvim_create_autocmd('TextChangedI', {
     end
   end,
 })
+
+-- ---------------------------------------------------------------------------
+-- Menu border, matching the picker floats (BORDER and PickerBorder in core/picker.lua).
+--
+-- Neovim 0.12 has 'pumborder'. Before that the popup menu is not a window and cannot
+-- have one, so we draw an empty bordered float exactly around it, one z-level below
+-- (the menu is zindex 100). The menu paints over the float's interior and only the frame
+-- shows. CompleteChanged fires every time the menu moves, resizes or refilters, so the
+-- frame follows it. Windows cannot be touched under CompleteChanged's textlock, so the
+-- redraw is scheduled and re-reads the geometry with pum_getpos() (empty once closed).
+-- ---------------------------------------------------------------------------
+
+local BORDER = 'single'
+local WINHL = 'Normal:PickerNormal,NormalFloat:PickerNormal,FloatBorder:PickerBorder'
+
+if pcall(function() return vim.o.pumborder end) then
+  vim.o.pumborder = BORDER
+else
+  -- The 8-char form of BORDER, so individual sides can be blanked.
+  local BORDER_CHARS = { '┌', '─', '┐', '│', '┘', '─', '└', '│' }
+  local frame = { buf = nil, win = nil }
+
+  local function close()
+    if frame.win and vim.api.nvim_win_is_valid(frame.win) then
+      vim.api.nvim_win_close(frame.win, true)
+    end
+    frame.win = nil
+  end
+
+  local function draw(ev)
+    if vim.fn.mode() ~= 'i' or not ev.width or ev.width == 0 or ev.height == 0 then
+      return close()
+    end
+    -- A float's row/col is its outer corner, border included, so step one cell up-left
+    -- of the menu. The scrollbar is an extra column to the right of `width`. A menu
+    -- flush against the screen's top or left edge has no room for that side, so it is
+    -- left undrawn rather than letting Neovim shift the whole frame onto the menu.
+    local chars = vim.deepcopy(BORDER_CHARS)
+    local top, left = ev.row >= 1, ev.col >= 1
+    if not top then
+      chars[1], chars[2], chars[3] = '', '', ''
+    end
+    if not left then
+      chars[1], chars[7], chars[8] = '', '', ''
+    end
+    local cfg = {
+      relative = 'editor',
+      row = top and ev.row - 1 or ev.row,
+      col = left and ev.col - 1 or ev.col,
+      width = ev.width + (ev.scrollbar and 1 or 0),
+      height = ev.height,
+      border = chars,
+      style = 'minimal',
+      focusable = false,
+      zindex = 99,
+      noautocmd = true,
+    }
+    if frame.win and vim.api.nvim_win_is_valid(frame.win) then
+      cfg.noautocmd = nil
+      vim.api.nvim_win_set_config(frame.win, cfg)
+      return
+    end
+    if not (frame.buf and vim.api.nvim_buf_is_valid(frame.buf)) then
+      frame.buf = vim.api.nvim_create_buf(false, true)
+    end
+    frame.win = vim.api.nvim_open_win(frame.buf, false, cfg)
+    vim.wo[frame.win].winhighlight = WINHL
+  end
+
+  local function register(opts)
+    vim.api.nvim_create_autocmd('CompleteChanged', vim.tbl_extend('force', opts, {
+      callback = function()
+        vim.schedule(function()
+          draw(vim.fn.pum_getpos())
+        end)
+      end,
+    }))
+    vim.api.nvim_create_autocmd({ 'CompleteDone', 'InsertLeave' }, vim.tbl_extend('force', opts, {
+      callback = function()
+        vim.schedule(close)
+      end,
+    }))
+  end
+
+  -- Global, for <C-n>/<C-x> completion in any buffer.
+  register { group = vim.api.nvim_create_augroup('completion-border', { clear = true }) }
+
+  -- Buffer-local again from LspAttach (core/lsp.lua). On the restricted machine global
+  -- augroups made here have been seen to vanish after startup (same as the keyword
+  -- autotrigger), and buffer-local ones made at attach time survive. Doubling up is
+  -- harmless: both redraw the same frame.
+  M.attach_border = function(buf)
+    if vim.b[buf].pum_border then
+      return
+    end
+    vim.b[buf].pum_border = true
+    register { buffer = buf }
+  end
+end
+
+return M

@@ -18,6 +18,7 @@ require 'core.explorer' -- <leader>E reveal file in netrw
 require 'core.peek' -- <leader>pd peek definition
 require 'core.picker' -- <leader>sf / sg / sw / sb / /
 require 'core.gitblame' -- <leader>gb
+require 'core.gitsigns' -- change signs in the sign column, ]h [h, hunk stage/reset
 require 'core.lualine' -- 'statusline' + LSP breadcrumbs
 require 'core.tabline' -- 'tabline' for tab pages
 require 'core.cursorword' -- highlight other occurrences of the word under the cursor
