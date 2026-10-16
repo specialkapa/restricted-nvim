@@ -173,7 +173,9 @@ vim.api.nvim_create_autocmd('LspAttach', {
 
     -- Native completion (0.11+). On older builds vim.lsp.start has already set
     -- 'omnifunc', so <C-x><C-o> works regardless.
-    if vim.lsp.completion and vim.lsp.completion.enable then
+    -- Only for servers that complete: vim.lsp.completion.get() waits for a reply from
+    -- every enabled client, so enabling ruff here leaves bare-word completion hanging.
+    if vim.lsp.completion and vim.lsp.completion.enable and client.server_capabilities.completionProvider then
       pcall(vim.lsp.completion.enable, true, client.id, args.buf, { autotrigger = true })
     end
 

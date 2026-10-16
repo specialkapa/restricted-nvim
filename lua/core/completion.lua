@@ -55,6 +55,16 @@ vim.keymap.set('i', '<S-Tab>', function()
   return vim.fn.pumvisible() == 1 and '<C-p>' or '<S-Tab>'
 end, { expr = true, desc = 'Previous completion' })
 
+-- <C-j> / <C-k> move through the menu; with it closed they keep their insert-mode meaning
+-- (newline / digraph).
+vim.keymap.set('i', '<C-j>', function()
+  return vim.fn.pumvisible() == 1 and '<C-n>' or '<C-j>'
+end, { expr = true, desc = 'Next completion' })
+
+vim.keymap.set('i', '<C-k>', function()
+  return vim.fn.pumvisible() == 1 and '<C-p>' or '<C-k>'
+end, { expr = true, desc = 'Previous completion' })
+
 vim.keymap.set('i', '<C-Space>', function()
   if has_native then
     vim.lsp.completion.get()

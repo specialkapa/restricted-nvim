@@ -328,7 +328,9 @@ end
 local function send_exceptions(s, cb)
   local filters = {}
   for _, f in ipairs(M.exception_filters) do
-    if M.exceptions_on[f.filter] then
+    -- pytest catches every failure, so "uncaught" never fires in a test. userUnhandled
+    -- stops where an exception leaves your code: the failing assert, not pytest.raises.
+    if M.exceptions_on[f.filter] or (s.opts.test and f.filter == 'userUnhandled') then
       filters[#filters + 1] = f.filter
     end
   end
@@ -502,8 +504,23 @@ events.output = function(_, body)
   end
 end
 
-events.exited = function(_, body)
-  emit('output', { category = 'console', output = ('process exited with code %s\n'):format(body.exitCode) })
+-- pytest's exit codes, so a run that ends without stopping says why.
+local PYTEST_EXIT = {
+  [0] = 'all tests passed',
+  [1] = 'tests failed',
+  [2] = 'interrupted',
+  [3] = 'internal error',
+  [4] = 'usage error, see the terminal',
+  [5] = 'no tests collected',
+}
+
+events.exited = function(s, body)
+  local msg = ('process exited with code %s'):format(body.exitCode)
+  if s.opts.test and PYTEST_EXIT[body.exitCode] then
+    msg = msg .. ' (' .. PYTEST_EXIT[body.exitCode] .. ')'
+  end
+  emit('output', { category = 'console', output = msg .. '\n' })
+  vim.notify('debug session ended: ' .. msg, body.exitCode == 0 and vim.log.levels.INFO or WARN)
 end
 
 local function close(s)
@@ -526,7 +543,7 @@ local function close(s)
   end
   emit('end', s)
   if s.restart then
-    M.start(s.config)
+    M.start(s.config, s.opts)
   end
 end
 
@@ -586,27 +603,30 @@ local function interpreter()
 end
 
 local importable = {}
-local function has_debugpy(py)
-  if importable[py] == nil then
+local function can_import(py, module)
+  local key = py .. ':' .. module
+  if importable[key] == nil then
     local ok, res = pcall(function()
-      return vim.system({ py, '-c', 'import debugpy' }):wait()
+      return vim.system({ py, '-c', 'import ' .. module }):wait()
     end)
-    importable[py] = ok and res.code == 0
+    importable[key] = ok and res.code == 0
   end
-  return importable[py]
+  return importable[key]
 end
 
-function M.start(config)
+---opts.test marks a pytest run (see send_exceptions).
+function M.start(config, opts)
   if M.session then
     return vim.notify('a debug session is already running (<leader>dq stops it)', WARN)
   end
   local py = interpreter()
-  if not has_debugpy(py) then
+  if not can_import(py, 'debugpy') then
     return vim.notify(('debugpy is not importable by %s\nInstall it into that env: conda install debugpy'):format(py), ERROR)
   end
 
   local stdin, stdout, stderr = uv.new_pipe(false), uv.new_pipe(false), uv.new_pipe(false)
   local s = { seq = 0, callbacks = {}, capabilities = {}, threads = {}, frames = {}, config = config, stderr = '' }
+  s.opts = opts or {}
   local handle
   handle = uv.spawn(py, { args = { '-m', 'debugpy.adapter' }, stdio = { stdin, stdout, stderr } }, function(code)
     handle:close()
@@ -633,7 +653,7 @@ function M.start(config)
     end
   end)
 
-  M.session, M.last_config = s, config
+  M.session, M.last_config, M.last_opts = s, config, s.opts
   emit('start', s)
   request(s, 'initialize', {
     clientID = 'neovim',
@@ -661,12 +681,12 @@ function M.start(config)
   end)
 end
 
-local function launch_config(file, args)
-  return {
-    name = vim.fs.basename(file),
+---target: { program = file } or { module = 'pytest' }.
+local function launch_config(name, target, args)
+  return vim.tbl_extend('force', {
+    name = name,
     type = 'python',
     request = 'launch',
-    program = file,
     args = args or {},
     cwd = root(),
     console = 'integratedTerminal', -- runs in a terminal split, so input() works
@@ -674,7 +694,7 @@ local function launch_config(file, args)
     showReturnValue = true,
     -- init.lua points breakpoint() at ipdb; under debugpy it should stop here instead.
     env = { PYTHONBREAKPOINT = 'debugpy.breakpoint' },
-  }
+  }, target)
 end
 
 ---Debug the current file. From a non-python buffer, re-run the last program.
@@ -682,14 +702,70 @@ function M.start_file(args)
   local file = buf_path(vim.api.nvim_get_current_buf())
   if not file or vim.bo.filetype ~= 'python' then
     if M.last_config then
-      return M.start(M.last_config)
+      return M.start(M.last_config, M.last_opts)
     end
     return vim.notify('open a python file to debug', WARN)
   end
   if vim.bo.modified then
     vim.cmd 'write'
   end
-  M.start(launch_config(file, args))
+  M.start(launch_config(vim.fs.basename(file), { program = file }, args))
+end
+
+---Walk up from the cursor by indentation: the enclosing `def test_*`, and the
+---`class Test*` around it. Returns e.g. { 'TestGroup', 'test_param' }, or nil.
+local function test_at_cursor()
+  local lnum = vim.api.nvim_win_get_cursor(0)[1]
+  local lines = vim.api.nvim_buf_get_lines(0, 0, lnum, false)
+  local parts, limit, found = {}, math.huge, false
+  for i = lnum, 1, -1 do
+    local line = lines[i]
+    local indent, kind, name = line:match '^(%s*)async%s+(def)%s+([%w_]+)'
+    if not indent then
+      indent, kind, name = line:match '^(%s*)(%a+)%s+([%w_]+)'
+    end
+    if (kind == 'def' or kind == 'class') and #indent < limit then
+      limit = #indent
+      if kind == 'def' and not found and name:match '^test' then
+        found = true
+        table.insert(parts, 1, name)
+      elseif kind == 'class' and found and name:match '^Test' then
+        table.insert(parts, 1, name)
+      end
+      if limit == 0 then
+        break
+      end
+    end
+  end
+  return found and parts or nil
+end
+
+---Debug pytest on the test under the cursor (scope 'test') or the whole file ('file').
+---extra: more pytest arguments, e.g. { '-k', 'slow' }.
+function M.start_test(scope, extra)
+  local file = buf_path(vim.api.nvim_get_current_buf())
+  if not file or vim.bo.filetype ~= 'python' then
+    return vim.notify('open a python test file', WARN)
+  end
+  local py = interpreter()
+  if not can_import(py, 'pytest') then
+    return vim.notify(('pytest is not importable by %s\nInstall it into that env: conda install pytest'):format(py), vim.log.levels.ERROR)
+  end
+  local target, label = file, vim.fs.basename(file)
+  if scope == 'test' then
+    local parts = test_at_cursor()
+    if not parts then
+      return vim.notify('no test function around the cursor', WARN)
+    end
+    -- No parametrize id: a node id without one runs every parameter set.
+    label = table.concat(parts, '::')
+    target = file .. '::' .. label
+  end
+  if vim.bo.modified then
+    vim.cmd 'write'
+  end
+  local args = vim.list_extend({ target }, extra or {})
+  M.start(launch_config('pytest ' .. label, { module = 'pytest' }, args), { test = true })
 end
 
 function M.terminate()
@@ -714,7 +790,7 @@ function M.restart()
     return M.terminate()
   end
   if M.last_config then
-    M.start(M.last_config)
+    M.start(M.last_config, M.last_opts)
   end
 end
 
@@ -889,6 +965,12 @@ map('n', '<leader>dc', M.continue, { desc = '[D]ebug: [C]ontinue (or start)' })
 map('n', '<leader>dn', M.step_over, { desc = '[D]ebug: [N]ext line (step over)' })
 map('n', '<leader>di', M.step_into, { desc = '[D]ebug: Step [I]nto' })
 map('n', '<leader>do', M.step_out, { desc = '[D]ebug: Step [O]ut' })
+map('n', '<leader>df', function()
+  M.start_test 'test'
+end, { desc = '[D]ebug: test [F]unction under the cursor (pytest)' })
+map('n', '<leader>dF', function()
+  M.start_test 'file'
+end, { desc = '[D]ebug: every test in the [F]ile (pytest)' })
 map('n', '<leader>dt', M.run_to_cursor, { desc = '[D]ebug: Run [T]o cursor' })
 map('n', '<leader>dp', M.pause, { desc = '[D]ebug: [P]ause' })
 map('n', '<leader>dq', M.terminate, { desc = '[D]ebug: [Q]uit (twice kills)' })
@@ -929,6 +1011,9 @@ end, { desc = 'Debug: Show value in float' })
 vim.api.nvim_create_user_command('DapStart', function(o)
   M.start_file(o.fargs)
 end, { nargs = '*', desc = 'Debug the current file, passing arguments' })
+vim.api.nvim_create_user_command('DapTest', function(o)
+  M.start_test(o.bang and 'file' or 'test', o.fargs)
+end, { nargs = '*', bang = true, desc = 'Debug the test under the cursor (! = whole file), with pytest args' })
 vim.api.nvim_create_user_command('DapPause', M.pause, { desc = 'Pause the running program' })
 vim.api.nvim_create_user_command('DapTerminate', M.terminate, { desc = 'Stop debugging' })
 

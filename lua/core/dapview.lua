@@ -235,7 +235,12 @@ end
 render.exceptions = function(b)
   for _, f in ipairs(dap.exception_filters) do
     local on = dap.exceptions_on[f.filter]
-    add(b, { { on and '[x] ' or '[ ] ', on and 'DiagnosticOk' or 'Comment' }, { f.label } }, { filter = f.filter })
+    local auto = not on and f.filter == 'userUnhandled' and dap.session and dap.session.opts.test
+    add(b, {
+      { (on or auto) and '[x] ' or '[ ] ', (on or auto) and 'DiagnosticOk' or 'Comment' },
+      { f.label },
+      { auto and '  (always on while debugging tests)' or '', 'Comment' },
+    }, { filter = f.filter })
   end
 end
 

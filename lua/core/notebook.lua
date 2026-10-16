@@ -4,7 +4,8 @@
 -- use, so ty, ruff and everything else that works on Python works here too:
 --
 --   # %%                 a code cell
---   # %% [markdown]      a markdown cell -- every line commented with '# '
+--   # %% [markdown]      a markdown cell -- every line commented with '# ' (<CR>, o and O
+--                        add it for you)
 --   # %% [raw]           a raw cell
 --
 -- :w turns it back into notebook JSON, keeping every cell's id, metadata and outputs,
@@ -20,7 +21,7 @@
 --   <leader>jn  run it and move to the next cell (adds one at the end, like Jupyter)
 --   <leader>ja  run all cells          <leader>jA  run all cells up to this one
 --   <leader>ji  interrupt the kernel   <leader>jR  restart it
---   <leader>jo  the cell's full output in a split; <CR> on an image opens it externally
+--   <leader>jo  the cell's full output in a float; <CR> on an image opens it externally
 --   <leader>jc  clear the cell's output   <leader>jC  clear all output
 --   <leader>jb  new code cell below    <leader>jm  new markdown cell below
 --   ]j / [j     next / previous cell
@@ -402,6 +403,8 @@ local TOP = LOWER:rep(300)
 local BOTTOM = UPPER:rep(300)
 local BAR = '\u{258E} ' -- ▎ left one-quarter block
 local SEP = ' ' .. DOT .. ' '
+-- For floats. Block elements rather than 'rounded' (box-drawing, dashed in many fonts).
+local BORDER = { LOWER, LOWER, LOWER, '\u{2595}', UPPER, UPPER, UPPER, '\u{258F}' } -- ▕ ▏
 
 ---The start of a header, up to where foldtext's preview begins. render() and foldtext()
 ---must draw exactly the same chunks, or a closed fold shows the overlay through it.
@@ -548,9 +551,32 @@ local function render(buf)
     end
     mark(last >= c.s and last - 1 or c.row or 0, { virt_lines = virt })
 
-    book.layout[i] = { start = (c.row or 0) + 1, header = c.row and c.row + 1, e = c.e, label = label }
+    book.layout[i] = { start = (c.row or 0) + 1, header = c.row and c.row + 1, e = c.e, label = label, type = c.type }
   end
   book.drawn_key = cursor and cursor_key(book, cursor)
+end
+
+---In a markdown cell, <CR>, o and O carry the '# ' on to the new line: Python's ftplugin
+---already declares '#' a comment leader, so this is just formatoptions' r and o -- on
+---only while the cursor is in a markdown cell, so code cells behave as they always did.
+local function sync_formatoptions(buf, row)
+  local book = books[buf]
+  local c
+  for _, x in ipairs(book.layout or {}) do
+    if x.start <= row then
+      c = x
+    end
+  end
+  local md = c and c.type == 'markdown' or false
+  if md == (book.saved_fo ~= nil) then
+    return
+  end
+  if md then
+    book.saved_fo = vim.bo[buf].formatoptions
+    vim.bo[buf].formatoptions = book.saved_fo:gsub('[ro]', '') .. 'ro'
+  else
+    vim.bo[buf].formatoptions, book.saved_fo = book.saved_fo, nil
+  end
 end
 
 ---Fold per cell: each '# %%' line opens a fold that runs to the next one.
@@ -906,7 +932,7 @@ function M.new_cell(type)
   vim.cmd('startinsert!')
 end
 
----Every output of the cell under the cursor, untruncated, in a scratch split.
+---Every output of the cell under the cursor, untruncated, in a floating window.
 function M.show_output()
   local buf = vim.api.nvim_get_current_buf()
   local c = cell_at(scan(buf), vim.api.nvim_win_get_cursor(0)[1])
@@ -915,7 +941,7 @@ function M.show_output()
     vim.notify('notebook: this cell has no output', vim.log.levels.INFO)
     return
   end
-  local lines, images = { status_line(d) }, {}
+  local lines, images = {}, {}
   for _, o in ipairs(d.outputs) do
     for _, e in ipairs(output_entries(o, true)) do
       lines[#lines + 1] = e[1]
@@ -926,13 +952,47 @@ function M.show_output()
     end
   end
 
-  vim.cmd('botright new')
-  local out = vim.api.nvim_get_current_buf()
-  vim.bo[out].buftype, vim.bo[out].bufhidden, vim.bo[out].swapfile = 'nofile', 'wipe', false
+  local out = vim.api.nvim_create_buf(false, true)
+  vim.bo[out].bufhidden = 'wipe'
   vim.api.nvim_buf_set_lines(out, 0, -1, false, lines)
   vim.bo[out].modifiable = false
-  vim.wo.wrap = false
-  vim.keymap.set('n', 'q', '<Cmd>close<CR>', { buffer = out, nowait = true })
+
+  -- A centred float, sized to the output but never more than most of the editor.
+  local title = ' output ' .. DOT .. ' ' .. status_line(d) .. ' '
+  local footer = next(images) and ' <CR> open image ' .. DOT .. ' q close ' or ' q close '
+  local width = math.max(vim.fn.strdisplaywidth(title), vim.fn.strdisplaywidth(footer)) + 4
+  for _, l in ipairs(lines) do
+    width = math.max(width, vim.fn.strdisplaywidth(l) + 1)
+  end
+  width = math.min(width, math.floor(vim.o.columns * 0.85))
+  local height = math.min(math.max(#lines, 1), math.floor((vim.o.lines - vim.o.cmdheight) * 0.8))
+  local win = vim.api.nvim_open_win(out, true, {
+    relative = 'editor',
+    row = math.floor((vim.o.lines - vim.o.cmdheight - height) / 2) - 1,
+    col = math.floor((vim.o.columns - width) / 2),
+    width = width,
+    height = height,
+    style = 'minimal',
+    border = BORDER,
+    title = title,
+    title_pos = 'center',
+    footer = footer,
+    footer_pos = 'right',
+  })
+  vim.wo[win].winhighlight = 'NormalFloat:Normal,FloatBorder:NotebookBorderActive,FloatTitle:NotebookLabel,FloatFooter:NotebookStatus'
+  vim.wo[win].wrap = false
+  vim.wo[win].cursorline = true
+  -- Like any popup: gone as soon as focus moves elsewhere.
+  vim.api.nvim_create_autocmd('WinLeave', {
+    buffer = out,
+    once = true,
+    callback = function()
+      pcall(vim.api.nvim_win_close, win, true)
+    end,
+  })
+  for _, key in ipairs({ 'q', '<Esc>' }) do
+    vim.keymap.set('n', key, '<Cmd>close<CR>', { buffer = out, nowait = true })
+  end
   vim.keymap.set('n', '<CR>', function()
     local img = images[vim.api.nvim_win_get_cursor(0)[1]]
     if not img then
@@ -960,7 +1020,7 @@ local ACTIONS = {
   { 'A', 'run all up to here', function() M.run_all(true) end },
   { 'i', 'interrupt kernel', op('interrupt', 'interrupt sent') },
   { 'R', 'restart kernel', op('restart', 'restarting kernel...') },
-  { 'o', 'full output in split', function() M.show_output() end },
+  { 'o', 'full output in float', function() M.show_output() end },
   { 'c', 'clear cell output', function() M.clear(false) end },
   { 'C', 'clear all output', function() M.clear(true) end },
   { 'b', 'new code cell below', function() M.new_cell('code') end },
@@ -1019,8 +1079,7 @@ function M.legend()
     width = width,
     height = #lines,
     style = 'minimal',
-    -- Block elements rather than 'rounded' (box-drawing, dashed in many fonts).
-    border = { LOWER, LOWER, LOWER, '\u{2595}', UPPER, UPPER, UPPER, '\u{258F}' }, -- ▕ ▏
+    border = BORDER,
     title = ' <leader>j ',
     title_pos = 'center',
     noautocmd = true,
@@ -1157,8 +1216,12 @@ local function read(buf, path)
       buffer = buf,
       callback = function()
         local b = books[buf]
-        if b and cursor_key(b, vim.api.nvim_win_get_cursor(0)[1]) ~= b.drawn_key then
+        local row = vim.api.nvim_win_get_cursor(0)[1]
+        if b and cursor_key(b, row) ~= b.drawn_key then
           render(buf)
+        end
+        if b then
+          sync_formatoptions(buf, row)
         end
       end,
     })
