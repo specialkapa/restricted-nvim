@@ -15,6 +15,9 @@
 --   <leader>gA    stage the whole file (git add)
 --   <leader>gR    reset the whole buffer to the index version
 --   <leader>tg    toggle the signs
+--
+-- M.counts(buf) gives the +/~/- line counts for the statusline; a `User GitSignsUpdate`
+-- autocmd fires whenever they may have changed.
 
 local M = {}
 
@@ -40,6 +43,10 @@ local enabled = true
 ---Hunks are vim.diff 'indices' results: { old_start, old_count, new_start, new_count },
 ---old = index, new = buffer.
 local cache = {}
+
+local function notify_update(buf)
+  vim.api.nvim_exec_autocmds('User', { pattern = 'GitSignsUpdate', modeline = false, data = { buf = buf } })
+end
 
 ---First group that is actually defined: Added/Changed/Removed exist in the default
 ---colorscheme since 0.10, but older colorschemes only define the Diff* groups.
@@ -127,6 +134,7 @@ local function compute(buf)
   local ok, hunks = pcall(diff, c.base, text, { result_type = 'indices', algorithm = 'histogram' })
   c.hunks, c.lines = ok and hunks or {}, lines
   place(buf)
+  notify_update(buf)
 end
 
 local function detach(buf)
@@ -137,6 +145,9 @@ local function detach(buf)
   cache[buf] = nil
   if vim.api.nvim_buf_is_valid(buf) then
     vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  end
+  if c then
+    notify_update(buf)
   end
 end
 
@@ -253,6 +264,24 @@ local function git_then_refresh(buf, cmd, opts, done_msg)
       attach(buf)
     end)
   end)
+end
+
+---Lines added, changed and removed vs the index, counted the way gitsigns does: a hunk
+---replacing 2 lines with 5 is 2 changed + 3 added. nil when git signs are not attached.
+function M.counts(buf)
+  local c = cache[buf == 0 and vim.api.nvim_get_current_buf() or buf]
+  if not c or not c.hunks then
+    return nil
+  end
+  local n = { added = 0, changed = 0, removed = 0 }
+  for _, h in ipairs(c.hunks) do
+    local old_count, count = h[2], h[4]
+    local common = math.min(old_count, count)
+    n.changed = n.changed + common
+    n.added = n.added + count - common
+    n.removed = n.removed + old_count - common
+  end
+  return n
 end
 
 function M.nav(dir)

@@ -3,10 +3,10 @@
 -- Mirrors the lualine layout from the main config:
 --   mode | branch | file [+] crumbs      macro  diff  diagnostics  enc  ft | line:col | %
 --
--- Every section is built from data Neovim already has, except the git bits: the branch
--- is read straight out of .git/HEAD (no subprocess) and the diff counts come from one
--- async `git diff --numstat` per save, cached. Nothing shells out during a redraw --
--- 'statusline' is re-evaluated on almost every keystroke, so it must stay cheap.
+-- Every section is built from data Neovim already has: the branch is read straight out
+-- of .git/HEAD (no subprocess), and the diff counts are core.gitsigns' hunks, so they
+-- follow unsaved edits. Nothing shells out during a redraw -- 'statusline' is
+-- re-evaluated on almost every keystroke, so it must stay cheap.
 --
 -- Breadcrumbs come from LSP textDocument/documentSymbol, the same source nvim-navic
 -- uses. NOT treesitter, so they work here with ty attached.
@@ -21,6 +21,7 @@ local ICONS = {
   error = 'E',
   warn = 'W',
   added = '+',
+  changed = '~',
   removed = '-',
 }
 
@@ -146,10 +147,10 @@ local function hl(group, text)
 end
 
 -- ---------------------------------------------------------------------------
--- Git: branch from .git/HEAD, diff counts from one async command per save.
+-- Git: branch from .git/HEAD. Diff counts come from core.gitsigns (section_diff).
 -- ---------------------------------------------------------------------------
 
-local branch_cache, diff_cache = {}, {}
+local branch_cache = {}
 
 local function git_dir(path)
   local found = vim.fs.find('.git', { upward = true, path = path })[1]
@@ -180,33 +181,6 @@ local function git_branch(path)
   local name = head:match('^ref:%s*refs/heads/(.+)$') or head:sub(1, 7)
   branch_cache[dir] = name
   return name
-end
-
----Refresh the +/- counts for one buffer, asynchronously.
-local function refresh_diff(bufnr)
-  if not vim.system then
-    return
-  end
-  local file = vim.api.nvim_buf_get_name(bufnr)
-  if file == '' or vim.bo[bufnr].buftype ~= '' then
-    return
-  end
-  local dir = vim.fs.dirname(file)
-  vim.system({ 'git', '-C', dir, 'diff', '--numstat', '--', file }, { text = true }, function(res)
-    local added, removed = 0, 0
-    for line in (res.stdout or ''):gmatch('[^\n]+') do
-      local a, r = line:match('^(%d+)%s+(%d+)')
-      if a then
-        added, removed = added + tonumber(a), removed + tonumber(r)
-      end
-    end
-    vim.schedule(function()
-      if vim.api.nvim_buf_is_valid(bufnr) then
-        diff_cache[bufnr] = { added = added, removed = removed }
-        vim.cmd.redrawstatus()
-      end
-    end)
-  end)
 end
 
 -- ---------------------------------------------------------------------------
@@ -362,14 +336,20 @@ local function section_macro()
   return hl('StlMacro', ' recording @' .. reg .. ' ')
 end
 
+---Read from core.gitsigns on each redraw: a loop over a handful of hunks, no git call.
+---Empty if gitsigns is not loaded, so the statusline still works without it.
 local function section_diff(bufnr)
-  local d = diff_cache[bufnr]
-  if not d or (d.added == 0 and d.removed == 0) then
+  local gitsigns = package.loaded['core.gitsigns']
+  local d = gitsigns and gitsigns.counts(bufnr)
+  if not d or (d.added == 0 and d.changed == 0 and d.removed == 0) then
     return ''
   end
   local out = ' '
   if d.added > 0 then
     out = out .. hl('StlAdd', ICONS.added .. d.added .. ' ')
+  end
+  if d.changed > 0 then
+    out = out .. hl('StlChange', ICONS.changed .. d.changed .. ' ')
   end
   if d.removed > 0 then
     out = out .. hl('StlDelete', ICONS.removed .. d.removed .. ' ')
@@ -469,17 +449,25 @@ vim.api.nvim_create_autocmd('ColorScheme', { group = group, callback = setup_hig
 -- Branch only changes on a checkout, so invalidate rather than poll.
 vim.api.nvim_create_autocmd({ 'BufEnter', 'FocusGained', 'DirChanged' }, {
   group = group,
-  callback = function(args)
+  callback = function()
     branch_cache = {}
-    refresh_diff(args.buf)
   end,
 })
 
 vim.api.nvim_create_autocmd('BufWritePost', {
   group = group,
   callback = function(args)
-    refresh_diff(args.buf)
     refresh_symbols(args.buf)
+  end,
+})
+
+-- gitsigns re-diffs after a pause in typing, i.e. after the redraw the edit itself
+-- caused, so the counts need a redraw of their own.
+vim.api.nvim_create_autocmd('User', {
+  group = group,
+  pattern = 'GitSignsUpdate',
+  callback = function()
+    vim.cmd.redrawstatus()
   end,
 })
 
@@ -503,7 +491,6 @@ vim.api.nvim_create_autocmd({ 'RecordingEnter', 'RecordingLeave' }, {
 vim.api.nvim_create_autocmd('BufDelete', {
   group = group,
   callback = function(args)
-    diff_cache[args.buf] = nil
     symbol_cache[args.buf] = nil
   end,
 })
