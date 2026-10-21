@@ -179,7 +179,6 @@ vim.api.nvim_create_autocmd('LspAttach', {
       pcall(vim.lsp.completion.enable, true, client.id, args.buf, { autotrigger = true })
     end
     if client.server_capabilities.completionProvider then
-      require('core.completion').attach_border(args.buf)
       require('core.completion').attach_autotrigger(args.buf)
     end
 

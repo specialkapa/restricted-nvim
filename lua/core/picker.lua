@@ -14,6 +14,11 @@
 --   gr          LSP references to the symbol under the cursor (mapped in core/lsp.lua)
 --   <leader>sk  keymaps -- <CR> runs a normal-mode mapping, the preview shows its code
 --   <leader>/   fuzzy find lines in the current buffer
+--
+-- In grep, references and buffer lines, <C-q> sends every match for the query (not just
+-- the ones drawn) to the quickfix list. After a grep it also types
+-- `:cdo s/\V<query>//ge | update` with the cursor on the replacement: type it and press
+-- <CR> to replace across the project, or <Esc> to just keep the list.
 
 local uv = vim.uv or vim.loop
 
@@ -257,8 +262,9 @@ local function search(dir, needle)
 	for _, f in ipairs(corpus(dir)) do
 		local lower, lines = f.lower, f.lines
 		for lnum = 1, #lower do
-			if lower[lnum]:find(needle, 1, true) then
-				out[#out + 1] = { file = f.file, lnum = lnum, text = vim.trim(lines[lnum]) }
+			local col = lower[lnum]:find(needle, 1, true)
+			if col then
+				out[#out + 1] = { file = f.file, lnum = lnum, col = col, text = vim.trim(lines[lnum]) }
 				if #out >= MAX_RESULTS then
 					return out
 				end
@@ -309,9 +315,9 @@ local function rg_search(dir, query, cb)
 			local items = {}
 			-- rg exits 1 for "no matches", which is not an error.
 			for line in (res.stdout or ""):gmatch("[^\n]+") do
-				local file, lnum, text = line:match("^(.-):(%d+):%d+:(.*)$")
+				local file, lnum, col, text = line:match("^(.-):(%d+):(%d+):(.*)$")
 				if file then
-					items[#items + 1] = { file = file, lnum = tonumber(lnum), text = vim.trim(text) }
+					items[#items + 1] = { file = file, lnum = tonumber(lnum), col = tonumber(col), text = vim.trim(text) }
 					if #items >= MAX_RESULTS then
 						break
 					end
@@ -335,6 +341,8 @@ end, { desc = "Drop the cached grep index" })
 
 ---@param opts table items|dynamic, prompt, on_choice, format(item), preview(item), initial,
 ---  on_enter(item) -- optional: what <CR> does when it is not "open with DEFAULT_ACTION"
+---  qf(item) -- optional: the item as a quickfix entry, which enables <C-q>
+---  on_qf(query) -- optional: runs after <C-q> filled the quickfix list
 local function pick(opts)
 	local format = opts.format or tostring
 	local has_preview = opts.preview ~= nil
@@ -351,9 +359,12 @@ local function pick(opts)
 	end
 
 	local display, by_text = {}, {}
+	-- The items behind `display`, in the same order. by_text keeps only the first item
+	-- per text, and two grep matches on one line share their text.
+	local current = {}
 
 	local function set_items(items)
-		display, by_text = {}, {}
+		display, by_text, current = {}, {}, items
 		for _, item in ipairs(items) do
 			local text = format(item)
 			display[#display + 1] = text
@@ -636,6 +647,44 @@ local function pick(opts)
 		vim.notify("yanked: " .. path, vim.log.levels.INFO)
 	end
 
+	---Every entry the query matches -- all of them, not just the MAX_RENDER drawn -- into
+	---the quickfix list, then open it. Sources opt in with opts.qf.
+	local function send_to_qf()
+		if not opts.qf then
+			flash_title("no quickfix list for this source")
+			return
+		end
+		local entries = {}
+		-- Unfiltered (a live grep's results, or an empty query) is every item in order;
+		-- after a fuzzy filter, go through the texts it kept.
+		local items = filtered == display and current or vim.tbl_map(function(text)
+			return by_text[text]
+		end, filtered)
+		for _, item in ipairs(items) do
+			entries[#entries + 1] = opts.qf(item)
+		end
+		if #entries == 0 then
+			flash_title("nothing to send")
+			return
+		end
+		local query = vim.trim(vim.api.nvim_buf_get_lines(prompt_buf, 0, 1, false)[1] or "")
+		close()
+		local title = (opts.prompt or "Pick") .. (query ~= "" and ": " .. query or "")
+		vim.fn.setqflist({}, " ", { title = title, items = entries })
+		vim.schedule(function()
+			vim.cmd("botright copen")
+			if #entries >= MAX_RESULTS then
+				vim.notify(
+					("quickfix: first %d matches only -- narrow the query for the rest"):format(MAX_RESULTS),
+					vim.log.levels.WARN
+				)
+			end
+			if opts.on_qf then
+				opts.on_qf(query)
+			end
+		end)
+	end
+
 	---Move the boundary between the results list and the preview by `cols`, keeping the
 	---picker's outer width, position and height fixed. Only the two lower windows are
 	---reconfigured; the prompt spans the full width and never changes.
@@ -711,6 +760,7 @@ local function pick(opts)
 		move(-1)
 	end)
 	map("<C-y>", yank_path)
+	map("<C-q>", send_to_qf)
 	-- Arrows are picker controls here, not text motions: Up/Down move the selection,
 	-- Left/Right move the divider. Editing the query is backspace and typing.
 	map("<Left>", function()
@@ -878,6 +928,22 @@ function M.oldfiles()
 	})
 end
 
+---Type the replace command for the grep results now in the quickfix list, cursor where
+---the replacement goes: :cdo s/\V<query>//ge | update. \V matches the query literally,
+---\c follows the search's case rule (rg's --smart-case; the Lua scan ignores case), and
+---`e` keeps :cdo going past a line whose second match the first pass already replaced.
+local function prefill_replace(query)
+	if query == "" then
+		return
+	end
+	-- Undo grep_word's regex escaping, then escape for a :s pattern.
+	local literal = query:gsub("\\(%p)", "%1"):gsub("\\", "\\\\"):gsub("/", "\\/")
+	local case = (not USE_RG or query == query:lower()) and "\\c" or ""
+	local tail = "/ge | update"
+	local cmd = ("cdo s/\\V%s%s/%s"):format(case, literal, tail)
+	vim.api.nvim_feedkeys(":" .. cmd .. string.rep(vim.keycode("<Left>"), #tail), "n", false)
+end
+
 ---Live grep: the prompt IS the pattern, re-scanned on every keystroke against the
 ---in-memory corpus. Plain substring, case-insensitive.
 local function live_grep(initial, dir)
@@ -918,6 +984,10 @@ local function live_grep(initial, dir)
 		path = function(r)
 			return vim.fs.normalize(dir .. "/" .. r.file)
 		end,
+		qf = function(r)
+			return { filename = vim.fs.normalize(dir .. "/" .. r.file), lnum = r.lnum, col = r.col or 1, text = r.text }
+		end,
+		on_qf = prefill_replace,
 		on_choice = function(r, action)
 			vim.cmd[action](vim.fn.fnameescape(vim.fs.normalize(dir .. "/" .. r.file)))
 			pcall(vim.api.nvim_win_set_cursor, 0, { r.lnum, 0 })
@@ -1160,6 +1230,9 @@ function M.buffer_lines()
 		preview = function(i)
 			return { lines = lines, ft = ft, lnum = i.lnum }
 		end,
+		qf = function(i)
+			return { bufnr = buf, lnum = i.lnum, text = i.text }
+		end,
 		on_choice = function(i, action)
 			local name = vim.api.nvim_buf_get_name(buf)
 			-- <CR> navigates within the buffer you are already in; only an explicit
@@ -1352,6 +1425,9 @@ function M.references()
 			end,
 			path = function(r)
 				return r.path
+			end,
+			qf = function(r)
+				return { filename = r.path, lnum = r.lnum, col = r.col + 1, text = r.text }
 			end,
 			on_choice = function(r, action)
 				vim.cmd[action](vim.fn.fnameescape(r.path))

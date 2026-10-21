@@ -6,9 +6,7 @@
 --
 -- Keymaps mirror the nvim-cmp setup on the main machine so muscle memory carries across.
 
-local M = {
-  attach_border = function() end,
-}
+local M = {}
 
 local has_native = vim.lsp.completion ~= nil and vim.lsp.completion.enable ~= nil
 
@@ -94,139 +92,96 @@ if vim.snippet then
 end
 
 -- ---------------------------------------------------------------------------
--- Keyword autotrigger.
+-- Autotrigger, standing in for cmp's nvim_lsp + buffer + path sources.
 --
 -- vim.lsp.completion's own `autotrigger` fires ONLY on the trigger characters the server
 -- advertises -- for python that is basically `.`, so typing a bare identifier never opens
 -- the menu. nvim-cmp triggered on any keyword character; this restores that. It doubles
 -- as the autotrigger for Neovim < 0.11, where 'omnifunc' is the only route.
 --
--- Buffer-local, attached from LspAttach (core/lsp.lua) for servers that complete. A global
--- augroup made here vanished after startup on the restricted machine; buffer-local
--- autocmds made at attach time survive. It feeds <C-x><C-o> (the omnifunc, which only
--- asks completion-capable servers), the route proven to work there.
+-- After two keyword characters it opens:
+--   * <C-x><C-o> (the LSP omnifunc) in a buffer with a server that completes
+--   * <C-n> (words from this and the other loaded buffers, per 'complete') anywhere else
+-- After a `/` ending a path that starts `/`, `./`, `../` or `~/` it opens <C-x><C-f>
+-- (file names, relative to the cwd) in any buffer, LSP or not.
+--
+-- Buffer-local. A global augroup made here vanished after startup on the restricted
+-- machine; buffer-local autocmds made at attach time survive. So it is attached both
+-- from LspAttach (core/lsp.lua) and from InsertEnter below, whichever comes first.
 --
 -- Once the menu is open Neovim filters it natively as you keep typing, so this fires at
 -- most once per word rather than on every keystroke.
 -- ---------------------------------------------------------------------------
 
+-- cmp-buffer's reach: this buffer, buffers in other windows, other loaded buffers. The
+-- default also scans unloaded buffers (read from disk) and tags, too slow per keystroke.
+vim.opt.complete = '.,w,b'
+
+local function lsp_completes(buf)
+  return #vim.lsp.get_clients { bufnr = buf, method = 'textDocument/completion' } > 0
+end
+
+-- `src/`, not `a/` -- so division in code never opens the file menu.
+local function ends_in_path(before)
+  local word = before:match '[^%s\'"`(=,]*$'
+  return word:match '/$' and (word:match '^%.?%.?/' or word:match '^~/') ~= nil
+end
+
 M.attach_autotrigger = function(buf)
-  if vim.b[buf].kw_autotrigger then
+  local bt = vim.bo[buf].buftype
+  if vim.b[buf].kw_autotrigger or (bt ~= '' and bt ~= 'acwrite') then
     return
   end
   vim.b[buf].kw_autotrigger = true
+  -- Accepting an entry changes the text too; without this the word you just accepted
+  -- would reopen the menu on itself.
+  vim.api.nvim_create_autocmd('CompleteDone', {
+    buffer = buf,
+    callback = function()
+      if vim.v.event.reason == 'accept' then
+        vim.b[buf].kw_accepted = true
+      end
+    end,
+  })
   vim.api.nvim_create_autocmd('TextChangedI', {
     buffer = buf,
     callback = function()
+      local accepted = vim.b[buf].kw_accepted
+      vim.b[buf].kw_accepted = nil
       if vim.fn.pumvisible() == 1 or vim.fn.mode() ~= 'i' then
         return
       end
       local before = vim.api.nvim_get_current_line():sub(1, vim.fn.col '.' - 1)
-      -- `.` is left to the native autotrigger when there is one.
-      if before:match '[%w_][%w_]$' or (not has_native and before:match '%.$') then
-        feed '<C-x><C-o>'
+      -- A <C-n> that finds nothing puts the text back, which fires TextChangedI again;
+      -- without this it would feed <C-n> forever and lock up the editor.
+      local key = vim.fn.line '.' .. ':' .. before
+      if vim.b[buf].kw_last == key then
+        return
+      end
+      vim.b[buf].kw_last = key
+      -- Checked before `accepted`: accepting a directory should open the next level.
+      if ends_in_path(before) then
+        feed '<C-x><C-f>'
+      elseif accepted then
+        return
+      elseif lsp_completes(buf) or vim.b[buf].kw_omni then
+        -- `.` is left to the native autotrigger when there is one. kw_omni marks a
+        -- buffer whose 'omnifunc' is not LSP (core.hive in SQL), so `.` is ours there.
+        if before:match '[%w_][%w_]$' or ((vim.b[buf].kw_omni or not has_native) and before:match '%.$') then
+          feed '<C-x><C-o>'
+        end
+      elseif before:match '[%w_][%w_]$' then
+        feed '<C-n>'
       end
     end,
   })
 end
 
--- ---------------------------------------------------------------------------
--- Menu border, matching the picker floats (BORDER and PickerBorder in core/picker.lua).
---
--- Neovim 0.12 has 'pumborder'. Before that the popup menu is not a window and cannot
--- have one, so we draw an empty bordered float exactly around it, one z-level below
--- (the menu is zindex 100). The menu paints over the float's interior and only the frame
--- shows. CompleteChanged fires every time the menu moves, resizes or refilters, so the
--- frame follows it. Windows cannot be touched under CompleteChanged's textlock, so the
--- redraw is scheduled and re-reads the geometry with pum_getpos() (empty once closed).
--- ---------------------------------------------------------------------------
-
-local BORDER = 'single'
-local WINHL = 'Normal:PickerNormal,NormalFloat:PickerNormal,FloatBorder:PickerBorder'
-
-if pcall(function() return vim.o.pumborder end) then
-  vim.o.pumborder = BORDER
-else
-  -- The 8-char form of BORDER, so individual sides can be blanked.
-  local BORDER_CHARS = { '┌', '─', '┐', '│', '┘', '─', '└', '│' }
-  local frame = { buf = nil, win = nil }
-
-  local function close()
-    if frame.win and vim.api.nvim_win_is_valid(frame.win) then
-      vim.api.nvim_win_close(frame.win, true)
-    end
-    frame.win = nil
-  end
-
-  local function draw(ev)
-    if vim.fn.mode() ~= 'i' or not ev.width or ev.width == 0 or ev.height == 0 then
-      return close()
-    end
-    -- A float's row/col is its outer corner, border included, so step one cell up-left
-    -- of the menu. The scrollbar is an extra column to the right of `width`. A menu
-    -- flush against the screen's top or left edge has no room for that side, so it is
-    -- left undrawn rather than letting Neovim shift the whole frame onto the menu.
-    local chars = vim.deepcopy(BORDER_CHARS)
-    local top, left = ev.row >= 1, ev.col >= 1
-    if not top then
-      chars[1], chars[2], chars[3] = '', '', ''
-    end
-    if not left then
-      chars[1], chars[7], chars[8] = '', '', ''
-    end
-    local cfg = {
-      relative = 'editor',
-      row = top and ev.row - 1 or ev.row,
-      col = left and ev.col - 1 or ev.col,
-      width = ev.width + (ev.scrollbar and 1 or 0),
-      height = ev.height,
-      border = chars,
-      style = 'minimal',
-      focusable = false,
-      zindex = 99,
-      noautocmd = true,
-    }
-    if frame.win and vim.api.nvim_win_is_valid(frame.win) then
-      cfg.noautocmd = nil
-      vim.api.nvim_win_set_config(frame.win, cfg)
-      return
-    end
-    if not (frame.buf and vim.api.nvim_buf_is_valid(frame.buf)) then
-      frame.buf = vim.api.nvim_create_buf(false, true)
-    end
-    frame.win = vim.api.nvim_open_win(frame.buf, false, cfg)
-    vim.wo[frame.win].winhighlight = WINHL
-  end
-
-  local function register(opts)
-    vim.api.nvim_create_autocmd('CompleteChanged', vim.tbl_extend('force', opts, {
-      callback = function()
-        vim.schedule(function()
-          draw(vim.fn.pum_getpos())
-        end)
-      end,
-    }))
-    vim.api.nvim_create_autocmd({ 'CompleteDone', 'InsertLeave' }, vim.tbl_extend('force', opts, {
-      callback = function()
-        vim.schedule(close)
-      end,
-    }))
-  end
-
-  -- Global, for <C-n>/<C-x> completion in any buffer.
-  register { group = vim.api.nvim_create_augroup('completion-border', { clear = true }) }
-
-  -- Buffer-local again from LspAttach (core/lsp.lua). On the restricted machine global
-  -- augroups made here have been seen to vanish after startup (same as the keyword
-  -- autotrigger), and buffer-local ones made at attach time survive. Doubling up is
-  -- harmless: both redraw the same frame.
-  M.attach_border = function(buf)
-    if vim.b[buf].pum_border then
-      return
-    end
-    vim.b[buf].pum_border = true
-    register { buffer = buf }
-  end
-end
+vim.api.nvim_create_autocmd('InsertEnter', {
+  group = vim.api.nvim_create_augroup('completion-autotrigger', { clear = true }),
+  callback = function(args)
+    M.attach_autotrigger(args.buf)
+  end,
+})
 
 return M
