@@ -13,13 +13,13 @@
 
 local M = {}
 
--- Plain ASCII by default so this renders in a bare terminal with no patched font.
+-- Standard Unicode (no Nerd Font needed) so this renders in a bare terminal with no patched font.
 local ICONS = {
   branch = '', -- ' ' with a Nerd Font
   modified = '[+]',
   readonly = '[RO]',
-  error = 'E',
-  warn = 'W',
+  error = '\u{2718}',
+  warn = '\u{25B2}',
   added = '+',
   changed = '~',
   removed = '-',

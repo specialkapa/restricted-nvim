@@ -21,12 +21,11 @@ local ROOT_MARKERS = { 'pyproject.toml', 'setup.py', '.git' }
 local WARN, ERROR = vim.log.levels.WARN, vim.log.levels.ERROR
 
 -- Plain ASCII, like core.pydebug: renders without a patched Nerd Font.
-vim.fn.sign_define('DapBreakpoint', { text = 'b', texthl = 'DiagnosticError' })
-vim.fn.sign_define('DapBreakpointCondition', { text = 'B', texthl = 'DiagnosticWarn' })
-vim.fn.sign_define('DapLogPoint', { text = 'L', texthl = 'DiagnosticInfo' })
-vim.fn.sign_define('DapBreakpointRejected', { text = 'R', texthl = 'DiagnosticHint' })
-vim.fn.sign_define('DapStopped', { text = '>', texthl = 'DiagnosticWarn', linehl = 'Visual' })
-
+vim.fn.sign_define('DapBreakpoint', { text = '\u{25CF}', texthl = 'DiagnosticError' })
+vim.fn.sign_define('DapBreakpointCondition', { text = '\u{25C6}', texthl = 'DiagnosticWarn' })
+vim.fn.sign_define('DapLogPoint', { text = '\u{25C7}', texthl = 'DiagnosticInfo' })
+vim.fn.sign_define('DapBreakpointRejected', { text = '\u{25CB}', texthl = 'DiagnosticHint' })
+vim.fn.sign_define('DapStopped', { text = '\u{2192}', texthl = 'DiagnosticWarn', linehl = 'Visual' })
 M.session = nil -- the running session, if any
 M.last_config = nil -- for <leader>dR after the program has ended
 

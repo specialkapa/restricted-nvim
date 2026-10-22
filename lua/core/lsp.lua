@@ -216,6 +216,14 @@ vim.api.nvim_create_autocmd('LspAttach', {
 vim.diagnostic.config {
   virtual_text = true,
   severity_sort = true,
+  signs = {
+    text = {
+      [vim.diagnostic.severity.ERROR] = '\u{2718}',
+      [vim.diagnostic.severity.WARN] = '\u{25B2}',
+      [vim.diagnostic.severity.INFO] = '\u{25CF}',
+      [vim.diagnostic.severity.HINT] = '\u{2691}',
+    },
+  },
   float = { border = 'single', source = true },
 }
 

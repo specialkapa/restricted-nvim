@@ -17,10 +17,9 @@ vim.env.PYTHONBREAKPOINT = DEBUGGER .. ".set_trace"
 
 -- Plain Unicode, deliberately: these render in any terminal font and need no patched
 -- Nerd Font. U+25C9 / U+25CE / U+00BB.
-vim.fn.sign_define("PyBreakpoint", { text = "b", texthl = "DiagnosticError" })
-vim.fn.sign_define("PyBreakpointCond", { text = "B", texthl = "DiagnosticWarn" })
-vim.fn.sign_define("PyDebugCurrent", { text = ">", texthl = "DiagnosticWarn", linehl = "Visual" })
-
+vim.fn.sign_define("PyBreakpoint", { text = "\u{25CF}", texthl = "DiagnosticError" })
+vim.fn.sign_define("PyBreakpointCond", { text = "\u{25C6}", texthl = "DiagnosticWarn" })
+vim.fn.sign_define("PyDebugCurrent", { text = "\u{2192}", texthl = "DiagnosticWarn", linehl = "Visual" })
 local SIGN_GROUP = "pydebug"
 local CURRENT_GROUP = "pydebug-current"
 local ROOT_MARKERS = { "pyproject.toml", "setup.py", ".git" }
