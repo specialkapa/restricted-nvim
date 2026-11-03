@@ -75,15 +75,10 @@ vim.keymap.set('i', '<C-Space>', function()
   end
 end, { desc = 'Trigger completion' })
 
--- <C-l> / <C-h> jump through snippet placeholders, standing in for LuaSnip. vim.snippet
--- is 0.11-era; on older builds the LSP client cannot expand snippets at all.
+-- <C-h> jumps back through snippet placeholders, standing in for LuaSnip. <C-l> (expand or
+-- jump forward) lives in core/snippets.lua. vim.snippet is 0.11-era; on older builds the
+-- LSP client cannot expand snippets at all.
 if vim.snippet then
-  vim.keymap.set({ 'i', 's' }, '<C-l>', function()
-    if vim.snippet.active { direction = 1 } then
-      vim.snippet.jump(1)
-    end
-  end, { desc = 'Snippet jump forward' })
-
   vim.keymap.set({ 'i', 's' }, '<C-h>', function()
     if vim.snippet.active { direction = -1 } then
       vim.snippet.jump(-1)
@@ -148,7 +143,7 @@ M.attach_autotrigger = function(buf)
     callback = function()
       local accepted = vim.b[buf].kw_accepted
       vim.b[buf].kw_accepted = nil
-      if vim.fn.pumvisible() == 1 or vim.fn.mode() ~= 'i' then
+      if not M.auto or vim.fn.pumvisible() == 1 or vim.fn.mode() ~= 'i' then
         return
       end
       local before = vim.api.nvim_get_current_line():sub(1, vim.fn.col '.' - 1)
@@ -183,5 +178,40 @@ vim.api.nvim_create_autocmd('InsertEnter', {
     M.attach_autotrigger(args.buf)
   end,
 })
+
+-- ---------------------------------------------------------------------------
+-- Turning it off for a while: <leader>ta / :AutocompleteToggle. Every buffer, this
+-- session only. Manual completion (<C-Space>, <C-x><C-o>, <C-n>) keeps working.
+-- ---------------------------------------------------------------------------
+
+M.auto = true -- read by the LspAttach handler in core/lsp.lua for buffers attached later
+
+---Re-register the buffer's completing clients with vim.lsp.completion, with or without its
+---autotrigger on `.`. All are disabled first: the autotrigger autocmds belong to the
+---buffer and are only rebuilt once its last client is gone.
+local function set_native(buf, on)
+  local clients = vim.lsp.get_clients { bufnr = buf, method = 'textDocument/completion' }
+  for _, c in ipairs(clients) do
+    pcall(vim.lsp.completion.enable, false, c.id, buf)
+  end
+  for _, c in ipairs(clients) do
+    pcall(vim.lsp.completion.enable, true, c.id, buf, { autotrigger = on })
+  end
+end
+
+M.toggle = function()
+  M.auto = not M.auto
+  if has_native then
+    for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+      if vim.api.nvim_buf_is_loaded(buf) then
+        set_native(buf, M.auto)
+      end
+    end
+  end
+  vim.notify('Autocompletion ' .. (M.auto and 'on' or 'off'))
+end
+
+vim.keymap.set('n', '<leader>ta', M.toggle, { desc = '[T]oggle [A]utocompletion' })
+vim.api.nvim_create_user_command('AutocompleteToggle', M.toggle, { desc = 'Toggle autocompletion' })
 
 return M

@@ -176,7 +176,7 @@ vim.api.nvim_create_autocmd('LspAttach', {
     -- Only for servers that complete: vim.lsp.completion.get() waits for a reply from
     -- every client enabled here, and ruff has no completion.
     if vim.lsp.completion and vim.lsp.completion.enable and client.server_capabilities.completionProvider then
-      pcall(vim.lsp.completion.enable, true, client.id, args.buf, { autotrigger = true })
+      pcall(vim.lsp.completion.enable, true, client.id, args.buf, { autotrigger = require('core.completion').auto })
     end
     if client.server_capabilities.completionProvider then
       require('core.completion').attach_autotrigger(args.buf)

@@ -11,9 +11,11 @@ require 'core.keymaps'
 
 require 'core.clipboard' -- wires up a clipboard provider if none exists
 require 'core.completion' -- sets 'completeopt' globally
+require 'core.snippets' -- <C-l> expands the trigger word before the cursor (vim.snippet)
 require 'core.lsp' -- FileType python -> vim.lsp.start
 require 'core.pyformat' -- BufWritePost *.py -> ruff on modified hunks
 require 'core.terminal' -- <leader>tt, TermOpen mappings
+require 'core.repl' -- <leader>rr IPython REPL in a vertical split, <leader>s* send code to it
 require 'core.explorer' -- <leader>E reveal file in netrw
 require 'core.peek' -- <leader>pd peek definition
 require 'core.picker' -- <leader>sf / sg / sw / sb / /
@@ -25,6 +27,7 @@ require 'core.hive' -- <leader>h*: HiveQL in .sql/.hql, schema browser, completi
 require 'core.lualine' -- 'statusline' + LSP breadcrumbs
 require 'core.tabline' -- 'tabline' for tab pages
 require 'core.cursorword' -- highlight other occurrences of the word under the cursor
+require 'core.flash' -- s / S / r / R label jumps, f t F T across lines, <C-s> in / search
 require 'core.notebook' -- BufReadCmd *.ipynb -> percent script, cells run in a Jupyter kernel
 require 'core.session' -- restore last session per CWD when started with no file args
 
