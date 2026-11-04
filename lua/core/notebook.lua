@@ -367,12 +367,27 @@ local function output_entries(o, full)
   return out
 end
 
+-- Braille spinner, the same frames and one-per-second pace as the hive results winbar.
+local SPIN = {
+  '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}',
+  '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280F}',
+}
+
+---Whole seconds a running cell has been going, or 0 before its 'start' event.
+local function running_secs(d)
+  return d.started and math.floor((vim.uv.hrtime() - d.started) / 1e9) or 0
+end
+
+local function spin(d)
+  return SPIN[running_secs(d) % #SPIN + 1]
+end
+
 local function status_line(d)
   local count = d.execution_count ~= vim.NIL and d.execution_count or nil
   if d.status == 'queued' then
     return '[ ] queued'
   elseif d.status == 'running' then
-    return '[*] running'
+    return ('[%s] running %ds'):format(spin(d), running_secs(d))
   elseif d.status == 'aborted' then
     return 'not run: ' .. (d.reason or 'an earlier cell failed')
   end
@@ -426,7 +441,7 @@ local function header_label(c, d)
     return c.type
   end
   if d and d.status == 'running' then
-    return '[*]'
+    return '[' .. spin(d) .. ']'
   end
   local n = d and d.execution_count
   return ('[%s]'):format(n and n ~= vim.NIL and n or ' ')
@@ -438,7 +453,7 @@ local function output_label(d)
   if d.status == 'queued' then
     return 'queued', 'NotebookStatus'
   elseif d.status == 'running' then
-    return 'running', 'NotebookStatus'
+    return ('%s running %ds'):format(spin(d), running_secs(d)), 'NotebookStatus'
   elseif d.status == 'aborted' then
     return 'not run: ' .. (d.reason or 'an earlier cell failed'), 'NotebookStatus'
   end
@@ -698,6 +713,31 @@ local function abort_pending(k, reason)
   end
 end
 
+-- While a cell runs, redraw once a second so its spinner and timer move. One timer per
+-- buffer; it stops itself once nothing in that buffer is running any more.
+local tickers = {}
+local function tick(buf)
+  if tickers[buf] then
+    return
+  end
+  local t = vim.uv.new_timer()
+  tickers[buf] = t
+  t:start(1000, 1000, vim.schedule_wrap(function()
+    local book = vim.api.nvim_buf_is_valid(buf) and books[buf]
+    local k = book and book.kernel
+    local busy = false
+    for _, d in pairs(k and k.reqs or {}) do
+      busy = busy or d.status == 'running'
+    end
+    if busy then
+      return schedule_render(buf)
+    end
+    t:stop()
+    t:close()
+    tickers[buf] = nil
+  end))
+end
+
 local function on_event(buf, k, ev)
   local d = ev.id and k.reqs[ev.id]
   if ev.ev == 'ready' then
@@ -705,6 +745,7 @@ local function on_event(buf, k, ev)
   elseif ev.ev == 'start' and d then
     d.status, d.started = 'running', vim.uv.hrtime()
     d.execution_count = ev.count
+    tick(buf)
   elseif ev.ev == 'output' and d then
     if d.clear_on_output then
       d.outputs, d.clear_on_output = {}, nil

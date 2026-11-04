@@ -94,9 +94,14 @@ end
 -- the menu. nvim-cmp triggered on any keyword character; this restores that. It doubles
 -- as the autotrigger for Neovim < 0.11, where 'omnifunc' is the only route.
 --
--- After two keyword characters it opens:
+-- Once a word is 3 keyword characters long, and you then pause for DELAY_MS, it opens:
 --   * <C-x><C-o> (the LSP omnifunc) in a buffer with a server that completes
 --   * <C-n> (words from this and the other loaded buffers, per 'complete') anywhere else
+-- Every key typed in the meantime restarts the wait, so typing a word quickly sends no
+-- request at all until you stop. It fires at most once per word: if the menu closes
+-- because nothing matches, it stays closed (<C-Space> asks again). Each request makes
+-- the server send its whole list -- thousands of items with ty -- and Neovim converts
+-- and fuzzy-matches all of them on the main thread, so asking once per word matters.
 -- After a `/` ending a path that starts `/`, `./`, `../` or `~/` it opens <C-x><C-f>
 -- (file names, relative to the cwd) in any buffer, LSP or not.
 --
@@ -104,13 +109,17 @@ end
 -- machine; buffer-local autocmds made at attach time survive. So it is attached both
 -- from LspAttach (core/lsp.lua) and from InsertEnter below, whichever comes first.
 --
--- Once the menu is open Neovim filters it natively as you keep typing, so this fires at
--- most once per word rather than on every keystroke.
+-- Once the menu is open Neovim filters it natively as you keep typing.
 -- ---------------------------------------------------------------------------
 
 -- cmp-buffer's reach: this buffer, buffers in other windows, other loaded buffers. The
 -- default also scans unloaded buffers (read from disk) and tags, too slow per keystroke.
 vim.opt.complete = '.,w,b'
+
+local MIN_CHARS = 3
+local DELAY_MS = 90
+
+local timer = (vim.uv or vim.loop).new_timer()
 
 local function lsp_completes(buf)
   return #vim.lsp.get_clients { bufnr = buf, method = 'textDocument/completion' } > 0
@@ -143,31 +152,62 @@ M.attach_autotrigger = function(buf)
     callback = function()
       local accepted = vim.b[buf].kw_accepted
       vim.b[buf].kw_accepted = nil
+      timer:stop() -- a new key cancels a pending trigger
       if not M.auto or vim.fn.pumvisible() == 1 or vim.fn.mode() ~= 'i' then
         return
       end
+      local lnum = vim.fn.line '.'
       local before = vim.api.nvim_get_current_line():sub(1, vim.fn.col '.' - 1)
       -- A <C-n> that finds nothing puts the text back, which fires TextChangedI again;
       -- without this it would feed <C-n> forever and lock up the editor.
-      local key = vim.fn.line '.' .. ':' .. before
+      local key = lnum .. ':' .. before
       if vim.b[buf].kw_last == key then
         return
       end
       vim.b[buf].kw_last = key
+
+      -- Paths and `.` open straight away, as before.
       -- Checked before `accepted`: accepting a directory should open the next level.
       if ends_in_path(before) then
-        feed '<C-x><C-f>'
-      elseif accepted then
-        return
-      elseif lsp_completes(buf) or vim.b[buf].kw_omni then
-        -- `.` is left to the native autotrigger when there is one. kw_omni marks a
-        -- buffer whose 'omnifunc' is not LSP (core.hive in SQL), so `.` is ours there.
-        if before:match '[%w_][%w_]$' or ((vim.b[buf].kw_omni or not has_native) and before:match '%.$') then
-          feed '<C-x><C-o>'
-        end
-      elseif before:match '[%w_][%w_]$' then
-        feed '<C-n>'
+        return feed '<C-x><C-f>'
       end
+      local lsp = lsp_completes(buf) or vim.b[buf].kw_omni
+      -- `.` is left to the native autotrigger when there is one. kw_omni marks a buffer
+      -- whose 'omnifunc' is not LSP (core.hive in SQL), so `.` is ours there.
+      if lsp and not accepted and (vim.b[buf].kw_omni or not has_native) and before:match '%.$' then
+        return feed '<C-x><C-o>'
+      end
+
+      -- Words: once per word, identified by its line and start column.
+      local word = before:match '[%w_]+$'
+      if not word or #word < MIN_CHARS then
+        return
+      end
+      local word_key = lnum .. ':' .. (#before - #word)
+      if accepted then
+        vim.b[buf].kw_word = word_key -- the word you just accepted is done
+        return
+      end
+      if vim.b[buf].kw_word == word_key then
+        return
+      end
+      timer:start(
+        DELAY_MS,
+        0,
+        vim.schedule_wrap(function()
+          -- Still typing in the same word, in the same buffer, with no menu open?
+          if vim.api.nvim_get_current_buf() ~= buf or vim.fn.mode() ~= 'i' or vim.fn.pumvisible() == 1 then
+            return
+          end
+          local now = vim.api.nvim_get_current_line():sub(1, vim.fn.col '.' - 1)
+          local w = now:match '[%w_]+$'
+          if not w or #w < MIN_CHARS or vim.fn.line '.' .. ':' .. (#now - #w) ~= word_key then
+            return
+          end
+          vim.b[buf].kw_word = word_key
+          feed(lsp and '<C-x><C-o>' or '<C-n>')
+        end)
+      )
     end,
   })
 end
