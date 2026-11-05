@@ -80,6 +80,9 @@
 --
 --   :HiveConnect  reconnect, re-reading vim.g.hive   :HiveDisconnect
 --   :HiveRun      run the statement under the cursor, or the lines of a range
+--   :HiveDropTable  drop the table under the cursor in the browser. No keymap on purpose:
+--                 a float shows database, table, type (managed tables lose their data)
+--                 and location, and the table name must be typed back to confirm.
 --   :HiveLog      the helper's stderr (driver warnings, tracebacks)
 
 local spinner = require 'lib.spinner'
@@ -1116,6 +1119,133 @@ function M.ddl(db, tbl)
   end)
 end
 
+-- ---------------------------------------------------------------------------
+-- Dropping a table: :HiveDropTable only (no keymap, so it can't be hit by accident), with
+-- the cursor on a table in the browser. A float shows what will go -- database, table,
+-- type and storage location -- and the table's name must be typed back to confirm.
+
+---Table Type and Location from DESCRIBE FORMATTED rows (label in column 1, value in 2).
+local function table_info(rows)
+  local info = {}
+  for _, r in ipairs(rows or {}) do
+    local k = r[1] ~= vim.NIL and vim.trim(r[1] or '') or ''
+    local v = r[2] ~= vim.NIL and vim.trim(r[2] or '') or ''
+    if k == 'Table Type:' then
+      info.type = v
+    elseif k == 'Location:' then
+      info.location = v
+    end
+  end
+  return info
+end
+
+local function confirm_drop(db, tbl, info)
+  local fq = q(db) .. '.' .. q(tbl)
+  local kind = info.type or 'unknown'
+  local effect = kind:find('MANAGED') and 'managed: its data files are deleted too'
+    or kind:find('EXTERNAL') and 'external: only the definition goes; the files stay'
+    or kind:find('VIEW') and 'a view: no data is deleted'
+    or 'could not be read; DROP may delete data'
+  local lines = {
+    '',
+    '  Database   ' .. db,
+    '  Table      ' .. tbl,
+    '  Type       ' .. kind,
+    '             ' .. effect,
+    '  Location   ' .. (info.location or 'unknown'),
+    '',
+    '  Runs       DROP TABLE ' .. fq,
+    '',
+  }
+  local width = 0
+  for _, l in ipairs(lines) do
+    width = math.max(width, vim.fn.strdisplaywidth(l) + 2)
+  end
+  width = math.min(math.max(width, 50), vim.o.columns - 4)
+  local height = #lines
+  local row = math.max(0, math.floor((vim.o.lines - height - 3) / 2) - 1)
+  local col = math.floor((vim.o.columns - width) / 2)
+
+  local ib = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(ib, 0, -1, false, lines)
+  vim.bo[ib].modifiable, vim.bo[ib].bufhidden = false, 'wipe'
+  local iw = vim.api.nvim_open_win(ib, false, {
+    relative = 'editor', row = row, col = col, width = width, height = height,
+    style = 'minimal', border = 'rounded', title = ' Drop table ', title_pos = 'center',
+    focusable = false, zindex = 60,
+  })
+  vim.wo[iw].winhighlight = 'NormalFloat:Normal,FloatBorder:HiveError,FloatTitle:HiveError'
+  local hns = vim.api.nvim_create_namespace('hive-drop')
+  vim.api.nvim_buf_set_extmark(ib, hns, 4, 0, { end_col = #lines[5], hl_group = kind:find('EXTERNAL') and 'HiveType' or 'HiveError' })
+
+  local cb = vim.api.nvim_create_buf(false, true)
+  vim.bo[cb].bufhidden = 'wipe'
+  local cw = vim.api.nvim_open_win(cb, true, {
+    relative = 'editor', row = row + height + 2, col = col, width = width, height = 1,
+    style = 'minimal', border = 'rounded', zindex = 60,
+    title = (' type %s to drop it '):format(tbl), title_pos = 'left',
+    footer = ' <CR> confirm  <Esc> cancel ', footer_pos = 'right',
+  })
+  vim.wo[cw].winhighlight = 'NormalFloat:Normal,FloatBorder:HiveError,FloatTitle:HiveError,FloatFooter:HiveType'
+
+  local closed = false
+  local function close()
+    if closed then
+      return
+    end
+    closed = true
+    pcall(vim.api.nvim_win_close, cw, true)
+    pcall(vim.api.nvim_win_close, iw, true)
+  end
+  local function submit()
+    local typed = vim.trim(vim.api.nvim_buf_get_lines(cb, 0, 1, false)[1] or '')
+    close()
+    if typed ~= tbl then
+      return notify(typed == '' and 'drop cancelled' or ('drop cancelled: %q is not %q'):format(typed, tbl), WARN)
+    end
+    notify('dropping ' .. db .. '.' .. tbl .. '...')
+    request({ op = 'query', lane = 'meta', stmts = { 'DROP TABLE ' .. fq }, limit = 1 }, function(ev)
+      if ev.ev == 'error' then
+        return notify('DROP TABLE ' .. fq .. ': ' .. ev.msg, ERROR)
+      end
+      cache['tables:' .. db], cache['cols:' .. db .. '.' .. tbl] = nil, nil
+      B.open[db .. '.' .. tbl] = nil
+      M.render_browser()
+      notify('dropped ' .. db .. '.' .. tbl)
+    end)
+  end
+  -- Leave insert mode in the box before closing it, so the cursor in the browser stays put.
+  local function from_insert(fn)
+    return function()
+      vim.schedule(fn)
+      return '<Esc>'
+    end
+  end
+  vim.keymap.set('i', '<CR>', from_insert(submit), { buffer = cb, expr = true })
+  vim.keymap.set('i', '<Esc>', from_insert(close), { buffer = cb, expr = true })
+  vim.keymap.set('i', '<C-c>', from_insert(close), { buffer = cb, expr = true })
+  vim.keymap.set('n', '<CR>', submit, { buffer = cb, nowait = true })
+  vim.keymap.set('n', '<Esc>', close, { buffer = cb, nowait = true })
+  vim.keymap.set('n', 'q', close, { buffer = cb, nowait = true })
+  vim.api.nvim_create_autocmd('WinLeave', { buffer = cb, once = true, callback = close })
+  vim.cmd.startinsert()
+end
+
+---:HiveDropTable -- the table under the cursor in the browser, after confirmation.
+function M.drop_table()
+  local r = B.buf and vim.api.nvim_get_current_buf() == B.buf and browser_row() or {}
+  if not (r.kind == 'node' and r.db and r.tbl) then
+    return notify('put the cursor on a table under a database in the Hive browser first', WARN)
+  end
+  local db, tbl = r.db, r.tbl
+  notify(('looking up %s.%s...'):format(db, tbl))
+  request({ op = 'query', lane = 'meta', stmts = { 'DESCRIBE FORMATTED ' .. q(db) .. '.' .. q(tbl) }, limit = 100000 },
+    function(ev)
+      -- Still offered if the lookup fails (e.g. no DESCRIBE rights), marked unknown.
+      confirm_drop(db, tbl, ev.ev == 'error' and {} or table_info(ev.rows))
+    end)
+end
+
 ---Run a table helper, or with `edit` put its SQL in the editor instead.
 local function helper(r, h, edit)
   if h[1] == 'ddl' then
@@ -1658,6 +1788,7 @@ cmd('HiveRun', function(o)
   end
 end, { range = true, desc = 'Run the statement under the cursor, or the range' })
 cmd('HiveCancel', M.cancel, { desc = 'Cancel the running Hive query' })
+cmd('HiveDropTable', M.drop_table, { desc = 'Drop the table under the cursor in the Hive browser (asks first)' })
 cmd('HiveBrowser', M.browser, { desc = 'Toggle the Hive schema browser' })
 cmd('HiveHistory', M.history, { desc = 'Hive query history' })
 cmd('HiveRefresh', M.refresh, { desc = 'Forget cached Hive schema' })
