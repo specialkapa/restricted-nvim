@@ -24,9 +24,14 @@
 -- Moved from the iron.nvim layout because this config already uses them: send file
 -- (<leader>sff is the picker) and focus (<leader>rf is rename-file).
 --
+-- Until the first prompt appears, the REPL window's bar shows an animation, the seconds
+-- so far, and how many sends are queued; they go in as soon as it is ready.
+--
 -- IPython gets code as one bracketed paste, so blank lines inside a function are fine.
 -- The plain console reads line by line: blank lines are dropped and one is added where a
 -- block ends, so blank lines inside a triple-quoted string are lost there.
+
+local spinner = require 'lib.spinner'
 
 local M = {}
 
@@ -41,6 +46,8 @@ local state = {
   kind = nil, -- 'ipython' or 'python'
   ready = false, -- the first prompt has appeared
   pending = {}, -- text sent before it did
+  started = nil, -- hrtime the process was started
+  stop_spin = nil, -- stops the startup animation
 }
 
 ---The environment's interpreter, the same search as notebook.lua.
@@ -91,8 +98,37 @@ local function find_win()
   return nil
 end
 
+---Window bar of every window showing the REPL: the startup animation, or nothing.
+local function show_status()
+  if not running() then
+    return
+  end
+  local bar = ''
+  if not state.ready then
+    local text = 'starting ' .. (state.kind == 'ipython' and 'IPython' or 'python')
+    bar = '%#Comment# ' .. spinner.label(state.started, text)
+    if #state.pending > 0 then
+      bar = bar .. (' \u{00B7} %d queued'):format(#state.pending)
+    end
+  end
+  for _, win in ipairs(vim.fn.win_findbuf(state.buf)) do
+    if vim.wo[win].winbar ~= bar then
+      vim.wo[win].winbar = bar
+    end
+  end
+end
+
+local function stop_status()
+  if state.stop_spin then
+    state.stop_spin()
+    state.stop_spin = nil
+  end
+end
+
 local function flush()
+  stop_status()
   state.ready = true
+  show_status() -- clears the bar
   for _, text in ipairs(state.pending) do
     vim.api.nvim_chan_send(state.chan, text)
   end
@@ -147,6 +183,9 @@ local function start(win)
     return
   end
   state.buf, state.chan, state.ready, state.pending = buf, chan, false, {}
+  state.started = vim.uv.hrtime()
+  stop_status()
+  state.stop_spin = spinner.tick(show_status)
 
   -- When the REPL exits, drop its buffer (and with it the window) so the next toggle
   -- starts a fresh one.
@@ -155,6 +194,7 @@ local function start(win)
     once = true,
     callback = function()
       if state.buf == buf then
+        stop_status()
         state.buf, state.chan = nil, nil
       end
       vim.schedule(function()

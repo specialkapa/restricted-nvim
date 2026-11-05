@@ -3,11 +3,15 @@
 --
 --   REPL [R]  Breakpoints [B]  Watches [W]  Scopes [S]  Exceptions [e]  Threads [T]
 --
+-- While the program starts or runs, the panel's bar animates with the seconds so far,
+-- so a long run is easy to tell from a hang.
+--
 -- In the panel: <CR>/<Tab> expand a variable, jump to a breakpoint or frame, or flip an
 -- exception filter. a/c/d add/change/delete a watch, d deletes a breakpoint, s sets a
 -- variable, y yanks a value, q closes. In the REPL, <Up>/<Down> walk the history.
 
 local dap = require 'core.dap'
+local spinner = require 'lib.spinner'
 
 local M = {}
 
@@ -166,8 +170,10 @@ local function not_stopped(b)
   local s = dap.session
   if not s then
     note(b, 'No debug session. <leader>ds debugs the current file.')
+  elseif not s.launched and not s.stopped then
+    note(b, ('Starting debugpy... %ds'):format(spinner.secs(s.since)))
   elseif not s.stopped then
-    note(b, 'Running... (:DapPause to break in)')
+    note(b, ('Running for %ds (:DapPause to break in)'):format(spinner.secs(s.since)))
   else
     return false
   end
@@ -370,8 +376,14 @@ local function winbar()
     parts[#parts + 1] = ('%s %s [%s] '):format(hl, sec.label, sec.key)
   end
   local s = dap.session
-  local state = not s and 'no session' or s.stopped and ('stopped: ' .. (s.reason or '?')) or 'running'
-  return table.concat(parts)
+  -- Starting / running goes first, animated: the bar is often too narrow for its end.
+  local busy = ''
+  if s and not s.stopped then
+    busy = '%#Comment# ' .. spinner.label(s.since, s.launched and 'running' or 'starting debugpy') .. ' '
+  end
+  local state = not s and 'no session' or s.stopped and ('stopped: ' .. (s.reason or '?')) or ''
+  return busy
+    .. table.concat(parts)
     .. '%#TabLineFill#%<%=%#Comment# '
     .. state:gsub('%%', '%%%%')
     .. '  <leader>d + c continue  n next  i into  o out  q quit '
@@ -748,6 +760,32 @@ redraw = function()
   end)
 end
 
+-- While a session is starting or running, animate the bar 8 times a second. The panel
+-- itself (with its "Running for Ns" note) is rebuilt only when the seconds change.
+local stop_tick, last_sec
+local function sync_tick()
+  local s = dap.session
+  local busy = s and not s.stopped
+  if busy and not stop_tick then
+    stop_tick = spinner.tick(function()
+      local cur = dap.session
+      if not (cur and valid_win(V.win)) then
+        return
+      end
+      local sec = spinner.secs(cur.since)
+      if sec ~= last_sec then
+        last_sec = sec
+        redraw()
+      else
+        vim.wo[V.win].winbar = winbar()
+      end
+    end)
+  elseif not busy and stop_tick then
+    stop_tick()
+    stop_tick, last_sec = nil, nil
+  end
+end
+
 dap.on(function(event, data)
   if event == 'start' then
     repl_buf()
@@ -780,6 +818,7 @@ dap.on(function(event, data)
     repl_append('stopped on ' .. msg, 'WarningMsg')
     vim.notify(msg, WARN)
   end
+  sync_tick()
   redraw()
 end)
 

@@ -56,6 +56,14 @@
 --   <leader>hb  the browser alone, in this tab  <leader>hh  query history
 --   <leader>hs  scratch.sql in this window
 --
+-- From any buffer (Python, a notebook, SQL), on a table or database name:
+--   <leader>ht  open the workspace with `SELECT * FROM <db>.<table> LIMIT 20;` in the
+--               editor. For a bare table name the database is a snippet placeholder,
+--               selected: type the name (completion offers databases), <Esc>, <leader>hr.
+--               On `db.table` it is filled in already.
+--   <leader>hd  open the workspace with that database expanded in the browser, the
+--               cursor on it. On `db.table` the table is expanded too.
+--
 -- All of these work outside the workspace too, on any .sql / .hql buffer.
 --
 -- In .sql / .hql buffers <C-x><C-o> (and the autotrigger in core.completion) completes
@@ -73,6 +81,8 @@
 --   :HiveConnect  reconnect, re-reading vim.g.hive   :HiveDisconnect
 --   :HiveRun      run the statement under the cursor, or the lines of a range
 --   :HiveLog      the helper's stderr (driver warnings, tracebacks)
+
+local spinner = require 'lib.spinner'
 
 local M = {}
 
@@ -276,6 +286,15 @@ local function start()
     return false
   end
   S.job = job
+  -- beeline takes seconds per connection: animate "connecting..." in the browser until
+  -- the helper reports it is connected (or exits, or is replaced by :HiveConnect).
+  S.connect_started = vim.uv.hrtime()
+  spinner.tick(function()
+    if S.job ~= job or S.connected then
+      return false
+    end
+    M.render_browser()
+  end, 'ellipsis')
   M.render_browser()
   -- The config goes over stdin, not argv, so a password never shows up in `ps`.
   vim.fn.chansend(job, vim.json.encode(cfg) .. '\n')
@@ -493,10 +512,8 @@ local function results_window(focus)
 end
 
 -- The connection status in the browser: filled / hollow circle, and an ellipsis.
-local ON, OFF, DOTS = vim.fn.nr2char(0x25CF), vim.fn.nr2char(0x25CB), vim.fn.nr2char(0x2026)
+local ON, OFF = vim.fn.nr2char(0x25CF), vim.fn.nr2char(0x25CB)
 
--- Braille spinner frames, by code point so the file stays ASCII here.
-local SPIN = vim.tbl_map(vim.fn.nr2char, { 0x280B, 0x2819, 0x2839, 0x2838, 0x283C, 0x2834, 0x2826, 0x2827, 0x2807, 0x280F })
 
 local function status()
   local esc = function(s)
@@ -504,9 +521,9 @@ local function status()
   end
   local run = S.running
   if run then
-    local secs = math.floor((vim.uv.hrtime() - run.started) / 1e9)
+    local secs = spinner.secs(run.started)
     local what = run.export and 'exporting' or run.cancelling and 'cancelling' or 'running'
-    return (' %s %s %ds  %s%%=<C-c> cancel '):format(SPIN[secs % #SPIN + 1], what, secs, esc(run.log or ''))
+    return (' %s %s %ds  %s%%=<C-c> cancel '):format(spinner.frame(run.started, 'braille'), what, secs, esc(run.log or ''))
   end
   local d = R.data
   if not d then
@@ -532,13 +549,13 @@ update_winbar = function()
   end
 end
 
-local timer
+local stop_ticking
 local function ticking(on)
-  timer = timer or vim.uv.new_timer()
-  if on then
-    timer:start(0, 1000, vim.schedule_wrap(update_winbar))
-  else
-    timer:stop()
+  if on and not stop_ticking then
+    stop_ticking = spinner.tick(update_winbar, 'braille')
+  elseif not on and stop_ticking then
+    stop_ticking()
+    stop_ticking = nil
   end
 end
 
@@ -963,6 +980,12 @@ local HELPERS = {
   { 'ddl' },
 }
 
+---The tail of "connecting": an animated ellipsis, then the seconds so far.
+local function connecting()
+  local secs = spinner.secs(S.connect_started)
+  return spinner.frame(S.connect_started, 'ellipsis') .. (secs >= 1 and (' ' .. secs .. 's') or '')
+end
+
 function M.render_browser()
   local b = B.buf
   if not (b and vim.api.nvim_buf_is_valid(b)) then
@@ -986,7 +1009,7 @@ function M.render_browser()
   local cfg = type(vim.g.hive) == 'table' and vim.g.hive or {}
   local where = cfg.host and ('%s:%s'):format(cfg.host, cfg.port or 10000) or 'hive (beeline)'
   add(' ', where, 'HiveHeader', {},
-    S.job and (S.connected and '  ' .. ON .. ' connected' or '  ' .. OFF .. ' connecting' .. DOTS) or '  ' .. OFF .. ' not connected')
+    S.job and (S.connected and '  ' .. ON .. ' connected' or '  ' .. OFF .. ' connecting' .. connecting()) or '  ' .. OFF .. ' not connected')
   add('', '', nil)
   add('+ ', 'New query', 'HiveHelper', { kind = 'new' })
   local files = saved_queries()
@@ -1040,6 +1063,29 @@ function M.render_browser()
   vim.bo[b].modifiable = true
   vim.api.nvim_buf_set_lines(b, 0, -1, false, lines)
   vim.bo[b].modifiable = false
+
+  -- <leader>hd: put the cursor on the node asked for, once it has loaded.
+  if B.reveal then
+    local found
+    for i, r in ipairs(rows) do
+      if r.kind == 'node' and r.key == B.reveal then
+        found = i
+        break
+      end
+    end
+    local win = vim.fn.bufwinid(b)
+    if found and win ~= -1 then
+      vim.api.nvim_win_set_cursor(win, { found, 0 })
+      vim.api.nvim_win_call(win, function()
+        vim.cmd('normal! zt')
+      end)
+      B.reveal = nil
+    elseif dbs and not (B.reveal:find('.', 1, true) and not cache['tables:' .. B.reveal:match('^[^.]+')]) then
+      -- Everything it depends on has loaded and it is not there.
+      notify('not found in the browser: ' .. B.reveal, vim.log.levels.WARN)
+      B.reveal = nil
+    end
+  end
   vim.api.nvim_buf_clear_namespace(b, ns, 0, -1)
   for _, m in ipairs(marks) do
     if m[4] and m[3] > m[2] then
@@ -1268,6 +1314,73 @@ function M.cycle(step)
   local buf = vim.api.nvim_get_current_buf()
   local cur = buf == B.buf and 1 or buf == R.buf and 3 or 2
   M.focus((cur - 1 + step) % 3 + 1)
+end
+
+-- ---------------------------------------------------------------------------
+-- The name under the cursor, from any buffer
+
+---`db.table`, `table` or `db` under the cursor: the run of name characters around it,
+---quotes and backticks dropped. Returns db, tbl (db nil for a bare name), or nil.
+local function name_at_cursor()
+  local line = vim.api.nvim_get_current_line()
+  local col = vim.api.nvim_win_get_cursor(0)[2] + 1
+  local s, e = col, col
+  while s > 1 and line:sub(s - 1, s - 1):match('[%w_.]') do
+    s = s - 1
+  end
+  while e <= #line and line:sub(e, e):match('[%w_.]') do
+    e = e + 1
+  end
+  local name = line:sub(s, e - 1):gsub('^%.+', ''):gsub('%.+$', '')
+  if name == '' then
+    return nil
+  end
+  local db, tbl = name:match('^([%w_]+)%.([%w_]+)$')
+  if db then
+    return db:lower(), tbl:lower()
+  end
+  return nil, name:match('^[%w_]+$') and name:lower() or nil
+end
+
+---<leader>ht: preview the table under the cursor in the workspace editor.
+function M.query_table()
+  local db, tbl = name_at_cursor()
+  if not tbl then
+    return notify('no table name under the cursor', vim.log.levels.WARN)
+  end
+  M.focus(2)
+  -- The editor pane can be showing any file; queries only ever go into SQL.
+  if vim.bo.filetype ~= 'sql' then
+    vim.cmd.edit(vim.fn.fnameescape(vim.fs.joinpath(query_dir(), 'scratch.sql')))
+  end
+  -- A separate statement at the end of the editor, like the browser's helpers.
+  local last = vim.api.nvim_buf_line_count(0)
+  local lines = vim.api.nvim_buf_get_lines(0, last - 1, last, false)[1] ~= '' and { '', '' } or { '' }
+  vim.api.nvim_buf_set_lines(0, last, last, false, lines)
+  vim.api.nvim_win_set_cursor(0, { vim.api.nvim_buf_line_count(0), 0 })
+  if db then
+    vim.api.nvim_set_current_line(('SELECT * FROM %s.%s LIMIT 20;'):format(db, tbl))
+  else
+    -- The database is a placeholder, selected so typing replaces it.
+    vim.snippet.expand(('SELECT * FROM ${1:database}.%s LIMIT 20;'):format(tbl))
+  end
+end
+
+---<leader>hd: the database (or db.table) under the cursor, expanded in the browser.
+function M.reveal()
+  local db, tbl = name_at_cursor()
+  db = db or tbl -- a bare name is the database here
+  if not db then
+    return notify('no database name under the cursor', vim.log.levels.WARN)
+  end
+  local key = tbl and db ~= tbl and (db .. '.' .. tbl) or db
+  B.open['#dbs'], B.open[db] = true, true
+  if key ~= db then
+    B.open[key] = true
+  end
+  B.reveal = key
+  M.focus(1)
+  M.render_browser()
 end
 
 -- ---------------------------------------------------------------------------
@@ -1528,6 +1641,8 @@ end
 map('n', '<leader>hh', M.history, { desc = '[H]ive: query [H]istory' })
 map('n', '<leader>ho', M.show, { desc = '[H]ive: [O]pen results' })
 map('n', '<leader>hs', M.scratch, { desc = '[H]ive: [S]cratch buffer' })
+map('n', '<leader>ht', M.query_table, { desc = '[H]ive: preview the [T]able under the cursor' })
+map('n', '<leader>hd', M.reveal, { desc = '[H]ive: show the [D]atabase under the cursor' })
 
 local cmd = vim.api.nvim_create_user_command
 cmd('Hive', M.workspace, { desc = 'Toggle the Hive workspace tab' })

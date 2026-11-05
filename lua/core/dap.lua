@@ -428,6 +428,7 @@ end
 
 local function resume(s)
   s.stopped, s.frame, s.frames, s.scopes, s.exception = false, nil, {}, nil, nil
+  s.since = uv.hrtime() -- running again: core.dapview times it from here
   clear_pc()
   emit 'continued'
 end
@@ -626,6 +627,9 @@ function M.start(config, opts)
   local stdin, stdout, stderr = uv.new_pipe(false), uv.new_pipe(false), uv.new_pipe(false)
   local s = { seq = 0, callbacks = {}, capabilities = {}, threads = {}, frames = {}, config = config, stderr = '' }
   s.opts = opts or {}
+  -- since: when the current wait began (starting, then each run between stops).
+  -- launched: debugpy has started the program; until then core.dapview says "starting".
+  s.since, s.launched = uv.hrtime(), false
   local handle
   handle = uv.spawn(py, { args = { '-m', 'debugpy.adapter' }, stdio = { stdin, stdout, stderr } }, function(code)
     handle:close()
@@ -674,8 +678,13 @@ function M.start(config, opts)
     request(s, 'launch', config, function(err2)
       if err2 then
         vim.notify('dap launch: ' .. err2, ERROR)
-        close(s)
+        return close(s)
       end
+      s.launched = true
+      if not s.stopped then
+        s.since = uv.hrtime()
+      end
+      emit 'launched'
     end)
   end)
 end

@@ -40,6 +40,8 @@
 --                  progress bars go there, not into the notebook -- same as Jupyter.
 --   :NotebookStop  shut the kernel down
 
+local spinner = require 'lib.spinner'
+
 local M = {}
 
 -- Output lines shown under a cell before it is cut short; <leader>jo shows the rest.
@@ -367,25 +369,34 @@ local function output_entries(o, full)
   return out
 end
 
--- Braille spinner, the same frames and one-per-second pace as the hive results winbar.
-local SPIN = {
-  '\u{280B}', '\u{2819}', '\u{2839}', '\u{2838}', '\u{283C}',
-  '\u{2834}', '\u{2826}', '\u{2827}', '\u{2807}', '\u{280F}',
-}
+-- Braille spinner (lib.spinner), the same style as the hive results winbar.
 
 ---Whole seconds a running cell has been going, or 0 before its 'start' event.
 local function running_secs(d)
-  return d.started and math.floor((vim.uv.hrtime() - d.started) / 1e9) or 0
+  return spinner.secs(d.started)
 end
 
 local function spin(d)
-  return SPIN[running_secs(d) % #SPIN + 1]
+  return spinner.frame(d.started, 'braille')
+end
+
+-- The kernel each queued cell waits on, so its label can say "starting kernel" while the
+-- kernel comes up. Weak keys: a cell's data never outlives its notebook because of this.
+local kernel_of = setmetatable({}, { __mode = 'k' })
+
+---Label for a queued cell: animated while its kernel is still starting (or restarting).
+local function queued(d)
+  local k = kernel_of[d]
+  if k and not k.ready then
+    return spinner.label(k.started, 'starting kernel', 'braille')
+  end
+  return 'queued'
 end
 
 local function status_line(d)
   local count = d.execution_count ~= vim.NIL and d.execution_count or nil
   if d.status == 'queued' then
-    return '[ ] queued'
+    return '[ ] ' .. queued(d)
   elseif d.status == 'running' then
     return ('[%s] running %ds'):format(spin(d), running_secs(d))
   elseif d.status == 'aborted' then
@@ -451,7 +462,7 @@ end
 ---never run in this session and has no saved output.
 local function output_label(d)
   if d.status == 'queued' then
-    return 'queued', 'NotebookStatus'
+    return queued(d), 'NotebookStatus'
   elseif d.status == 'running' then
     return ('%s running %ds'):format(spin(d), running_secs(d)), 'NotebookStatus'
   elseif d.status == 'aborted' then
@@ -510,7 +521,8 @@ local function render(buf)
   book.layout = {}
   for i, c in ipairs(list) do
     local d = c.data
-    local border = c == active and 'NotebookBorderActive' or 'NotebookBorder'
+    -- d.flash: a cell that just finished, its box fading from green / red (see 'done').
+    local border = d and d.flash or (c == active and 'NotebookBorderActive' or 'NotebookBorder')
     local label = header_label(c, d)
 
     -- The cursor in the blank lines below the active cell's code: stretch the box to it.
@@ -713,34 +725,33 @@ local function abort_pending(k, reason)
   end
 end
 
--- While a cell runs, redraw once a second so its spinner and timer move. One timer per
--- buffer; it stops itself once nothing in that buffer is running any more.
+-- While a cell runs or the kernel starts, redraw once a second so spinners and timers
+-- move. One timer per buffer; it stops itself once nothing in that buffer is waiting.
 local tickers = {}
 local function tick(buf)
   if tickers[buf] then
     return
   end
-  local t = vim.uv.new_timer()
-  tickers[buf] = t
-  t:start(1000, 1000, vim.schedule_wrap(function()
+  tickers[buf] = spinner.tick(function()
     local book = vim.api.nvim_buf_is_valid(buf) and books[buf]
     local k = book and book.kernel
-    local busy = false
+    local busy = k ~= nil and not k.ready
     for _, d in pairs(k and k.reqs or {}) do
       busy = busy or d.status == 'running'
     end
     if busy then
-      return schedule_render(buf)
+      schedule_render(buf)
+      return true
     end
-    t:stop()
-    t:close()
     tickers[buf] = nil
-  end))
+    return false
+  end, 'braille')
 end
 
 local function on_event(buf, k, ev)
   local d = ev.id and k.reqs[ev.id]
   if ev.ev == 'ready' then
+    k.ready = true
     vim.notify('notebook: kernel ready (' .. ev.python .. ')')
   elseif ev.ev == 'start' and d then
     d.status, d.started = 'running', vim.uv.hrtime()
@@ -769,6 +780,25 @@ local function on_event(buf, k, ev)
     d.status = ev.status == 'aborted' and 'aborted' or nil
     d.elapsed = d.started and vim.uv.hrtime() - d.started or nil
     d.started = nil
+    if d.status ~= 'aborted' then
+      -- Flash the cell's box green (or red on an error) and fade it back, so a cell that
+      -- finished while you were elsewhere in the notebook still catches your eye.
+      local failed = ev.status == 'error'
+      for _, o in ipairs(d.outputs) do
+        failed = failed or o.output_type == 'error'
+      end
+      local ok_hl = vim.fn.hlexists('DiagnosticOk') == 1 and 'DiagnosticOk' or 'String'
+      d.flash = require('lib.fade').group({
+        from = failed and 'DiagnosticError' or ok_hl,
+        to = 'NotebookBorder',
+        hold = 500,
+        duration = 900,
+        on_done = function()
+          d.flash = nil
+          schedule_render(buf)
+        end,
+      })
+    end
     if vim.api.nvim_buf_is_valid(buf) then
       vim.bo[buf].modified = true -- outputs changed; ZZ must not drop them silently
     end
@@ -783,6 +813,7 @@ local function on_event(buf, k, ev)
     abort_pending(k, 'the kernel died')
     vim.notify('notebook: the kernel died -- <leader>jR restarts it, :NotebookLog says why', vim.log.levels.ERROR)
   elseif ev.ev == 'restarted' then
+    k.ready = true
     vim.notify('notebook: kernel restarted')
   elseif ev.ev == 'fatal' then
     abort_pending(k, 'the kernel did not start')
@@ -803,7 +834,8 @@ local function start(buf)
   end
   local cwd = vim.fn.fnamemodify(vim.api.nvim_buf_get_name(buf), ':p:h')
   -- reqs: cells awaiting the kernel; inspects: <leader>jv requests, keyed the same way.
-  local k = { reqs = {}, inspects = {}, seq = 0, partial = '', stderr = {} }
+  -- ready/started: until the helper says 'ready', queued cells show "starting kernel".
+  local k = { reqs = {}, inspects = {}, seq = 0, partial = '', stderr = {}, ready = false, started = vim.uv.hrtime() }
 
   k.job = vim.fn.jobstart({ py, bridge_path(), cwd, log_path() }, {
     cwd = cwd,
@@ -841,6 +873,7 @@ local function start(buf)
   end
   book.kernel = k
   vim.notify('notebook: starting kernel...')
+  tick(buf)
   return k
 end
 
@@ -872,6 +905,7 @@ local function run(buf, list, lines)
       d.outputs, d.status, d.reason, d.elapsed, d.clear_on_output = {}, 'queued', nil, nil, nil
       k.seq = k.seq + 1
       k.reqs[k.seq] = d
+      kernel_of[d] = k
       send(k, { op = 'execute', id = k.seq, code = code })
     end
   end
@@ -934,6 +968,8 @@ local function op(name, msg)
     end
     if name == 'restart' then
       abort_pending(k, 'the kernel restarted')
+      k.ready, k.started = false, vim.uv.hrtime()
+      tick(vim.api.nvim_get_current_buf())
     end
     send(k, { op = name })
     if msg then

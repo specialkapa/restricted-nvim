@@ -127,6 +127,19 @@ local function ruff_format(input, bufname)
   return out, nil
 end
 
+---Briefly highlight the lines ruff changed, so a reformat is visible: diff the text from
+---before formatting against the buffer now, and flash the new side of every hunk. A pure
+---deletion flashes the line it happened under.
+local function flash_changes(bufnr, before)
+  local after = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
+  local ranges = {}
+  for _, h in ipairs(vim.diff(before, after, diff_opts) or {}) do
+    local start, count = h[3], h[4]
+    ranges[#ranges + 1] = count > 0 and { start, start + count - 1 } or { math.max(start, 1), math.max(start, 1) }
+  end
+  require('lib.fade').lines(bufnr, ranges)
+end
+
 ---Mutates the buffer in place; returns true if anything changed.
 local function format_python(bufnr)
   local bufname = vim.api.nvim_buf_get_name(bufnr)
@@ -156,6 +169,7 @@ local function format_python(bufnr)
       return false
     end
     vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, vim.split(output, '\n', { plain = true, trimempty = false }))
+    flash_changes(bufnr, buf_content)
     return true
   end
 
@@ -232,6 +246,9 @@ local function format_python(bufnr)
     end
   end
 
+  if changed then
+    flash_changes(bufnr, buf_content)
+  end
   return changed
 end
 

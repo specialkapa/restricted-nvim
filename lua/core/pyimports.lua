@@ -449,6 +449,17 @@ local function apply(edits)
       vim.api.nvim_buf_call(buf, function()
         vim.cmd 'silent update'
       end)
+      -- Flash the rewritten lines where they ended up: walk top-down, shifting each edit
+      -- by how much the ones above it grew or shrank.
+      local ranges, shift = {}, 0
+      for i = #list, 1, -1 do
+        local e = list[i]
+        if #e.after > 0 then
+          ranges[#ranges + 1] = { e.first + shift, e.first + shift + #e.after - 1 }
+        end
+        shift = shift + #e.after - (e.last - e.first + 1)
+      end
+      require('lib.fade').lines(buf, ranges)
     else
       local lines = vim.fn.readfile(file)
       for _, e in ipairs(list) do

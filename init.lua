@@ -1,5 +1,6 @@
 -- Neovim config for restricted environments: no plugin manager, no plugins, no GitHub.
--- Everything under lua/core/ uses only built-in Neovim APIs.
+-- Everything under lua/core/ uses only built-in Neovim APIs. lua/lib/ holds helpers that
+-- core modules require themselves (lib.spinner); nothing here loads them directly.
 --
 -- Load order matters:
 --   * options/keymaps first, so <leader> is set before anything binds to it
@@ -29,6 +30,7 @@ require 'core.tabline' -- 'tabline' for tab pages
 require 'core.cursorword' -- highlight other occurrences of the word under the cursor
 require 'core.flash' -- s / S / r / R label jumps, f t F T across lines, <C-s> in / search
 require 'core.notebook' -- BufReadCmd *.ipynb -> percent script, cells run in a Jupyter kernel
+require 'core.csv' -- align .csv/.tsv columns, sticky header, :CsvFilter row filters
 require 'core.session' -- restore last session per CWD when started with no file args
 
 -- PYTHONBREAKPOINT lives here rather than in pydebug so `breakpoint()` still routes to
