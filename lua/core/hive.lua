@@ -49,6 +49,9 @@
 -- e puts the helper's SQL in the editor to edit first; on a table p preview, n count,
 -- d describe, P partitions, c DDL; i inserts the name; D deletes a saved query;
 -- R reloads the node; C reconnects. Opening the workspace connects.
+-- f opens a box over the filter row (above New query) that narrows the tree as you type:
+-- the databases, or, with the cursor on a table under an expanded database, that
+-- database's tables. <CR> keeps it, <Esc> undoes it, F clears every filter.
 --
 --   <leader>hr  run the statement under the cursor (statements end at `;`); in visual
 --               mode every statement in the selected lines. The last result set shows.
@@ -105,7 +108,7 @@ local S = { job = nil, seq = 0, reqs = {}, partial = '', stderr = {} }
 local cache, loading = {}, {}
 local current_db -- follows USE
 local R = { buf = nil, data = nil, sort = nil, starts = {} } -- the results window
-local B = { buf = nil, open = {}, rows = {} } -- the schema browser
+local B = { buf = nil, open = {}, rows = {}, filter = { dbs = '', tables = {} } } -- the schema browser
 local W = { tab = nil, editor = nil } -- the workspace tab page and its editor window
 
 local function in_workspace()
@@ -128,6 +131,7 @@ local function hl()
   set('HiveTable', 'Identifier')
   set('HiveType', 'Comment')
   set('HiveHelper', 'Function')
+  set('HiveFilter', 'Special')
 end
 hl()
 vim.api.nvim_create_autocmd('ColorScheme', { callback = hl })
@@ -447,7 +451,8 @@ local function results_buf()
   vim.bo[b].modifiable = false
   vim.api.nvim_buf_call(b, function()
     -- Alternatives, not a [...] class: retyped as ASCII, [|-+] would be a reverse range.
-    vim.cmd([[syntax match HiveSep /\V│\|─\|┼/]])
+    -- The table rules, by code point: \V makes them literal, no character class needed.
+    vim.cmd('syntax match HiveSep /\\V\u{2502}\\|\u{2500}\\|\u{253C}/')
     vim.cmd([[syntax match HiveNull /\<NULL\>/]])
   end)
   local map = function(lhs, fn, desc)
@@ -536,11 +541,11 @@ local function status()
   end
   local sql = esc(d.stmts[#d.stmts]:gsub('%s+', ' '))
   if #d.columns == 0 then
-    return (' done in %.1fs · %s'):format(d.secs, sql)
+    return (' done in %.1fs \u{00B7} %s'):format(d.secs, sql)
   end
   local n = #d.rows
-  local sorted = R.sort and (' · by %s %s'):format(esc(d.columns[R.sort.col]), R.sort.desc and '↓' or '↑') or ''
-  return (' %s row%s%s · %.1fs%s · %s%%=<CR> record  s sort  e/E csv  r rerun ')
+  local sorted = R.sort and (' \u{00B7} by %s %s'):format(esc(d.columns[R.sort.col]), R.sort.desc and '\u{2193}' or '\u{2191}') or ''
+  return (' %s row%s%s \u{00B7} %.1fs%s \u{00B7} %s%%=<CR> record  s sort  e/E csv  r rerun ')
     :format(commas(n), n == 1 and '' or 's', d.truncated and ' (limit)' or '', d.secs, sorted, sql)
 end
 
@@ -582,7 +587,7 @@ local function fit(s, w)
     n = n - 1
     out = vim.fn.strcharpart(out, 0, n)
   end
-  return out .. '…'
+  return out .. '\u{2026}'
 end
 
 local function pad(s, w, right)
@@ -611,7 +616,7 @@ local function render()
       if v == vim.NIL then
         line[c] = 'NULL'
       else
-        line[c] = v:gsub('\r?\n', '↵'):gsub('\t', ' ')
+        line[c] = v:gsub('\r?\n', '\u{21B5}'):gsub('\t', ' ')
         numeric[c] = numeric[c] and tonumber(v) ~= nil
       end
       widths[c] = math.min(MAXW, math.max(widths[c], dw(line[c])))
@@ -623,15 +628,15 @@ local function render()
     for c = 1, ncol do
       parts[c] = pad(fit(vals[c], widths[c]), widths[c], numeric[c])
     end
-    return (table.concat(parts, ' │ '):gsub('%s+$', ''))
+    return (table.concat(parts, ' \u{2502} '):gsub('%s+$', ''))
   end
   local sep = {}
   R.starts = { 1 }
   for c = 1, ncol do
-    sep[c] = string.rep('─', widths[c])
+    sep[c] = string.rep('\u{2500}', widths[c])
     R.starts[c + 1] = R.starts[c] + widths[c] + 3 -- ' │ ' is three cells wide
   end
-  local lines = { fmt(d.columns), table.concat(sep, '─┼─') }
+  local lines = { fmt(d.columns), table.concat(sep, '\u{2500}\u{253C}\u{2500}') }
   for r = 1, #cells do
     lines[r + 2] = fmt(cells[r])
   end
@@ -815,12 +820,23 @@ function M.sort()
   vim.fn.cursor(0, vim.fn.virtcol2col(0, vim.fn.line('.'), R.starts[c]))
 end
 
-local function ask_path(cb)
-  vim.ui.input({ prompt = 'CSV file: ', default = vim.fn.getcwd() .. '/result.csv', completion = 'file' }, function(p)
-    if p and p ~= '' then
+---Ask where to write a CSV. `what` says which rows go in it, for the dialog.
+local function ask_path(cb, what)
+  local d = R.data or {}
+  local sql = (d.stmts and d.stmts[#d.stmts] or ''):gsub('%s+', ' ')
+  require('lib.prompt').input({
+    title = 'Export to CSV',
+    info = {
+      'Query      ' .. (#sql > 70 and sql:sub(1, 67) .. '...' or sql),
+      'Rows       ' .. what,
+    },
+    box_title = 'file',
+    default = vim.fn.fnamemodify(vim.fn.getcwd(), ':~') .. '/result.csv',
+    complete = 'file',
+    on_submit = function(p)
       cb(vim.fs.normalize(vim.fn.fnamemodify(vim.fn.expand(p), ':p')))
-    end
-  end)
+    end,
+  })
 end
 
 function M.export()
@@ -828,7 +844,7 @@ function M.export()
   if d and d.stmts then
     ask_path(function(path)
       M.run(d.stmts, { export = path })
-    end)
+    end, 'every row: the query runs again, straight into the file')
   end
 end
 
@@ -851,7 +867,7 @@ function M.write_csv()
     if vim.fn.writefile(lines, path) == 0 then
       notify(('wrote %s rows to %s'):format(commas(#d.rows), path))
     end
-  end)
+  end, ('the %d row%s shown'):format(#d.rows, #d.rows == 1 and '' or 's'))
 end
 
 -- ---------------------------------------------------------------------------
@@ -983,6 +999,17 @@ local HELPERS = {
   { 'ddl' },
 }
 
+---`names` whose name contains `pat` (case-insensitive, plain text); all when no `pat`.
+local function filtered(names, pat)
+  if not pat or pat == '' then
+    return names
+  end
+  pat = pat:lower()
+  return vim.tbl_filter(function(n)
+    return n:lower():find(pat, 1, true) ~= nil
+  end, names)
+end
+
 ---The tail of "connecting": an animated ellipsis, then the seconds so far.
 local function connecting()
   local secs = spinner.secs(S.connect_started)
@@ -1005,7 +1032,7 @@ function M.render_browser()
     end
   end
   local arrow = function(key)
-    return B.open[key] and '▾ ' or '▸ '
+    return B.open[key] and '\u{25BE} ' or '\u{25B8} '
   end
   local render = M.render_browser
 
@@ -1013,6 +1040,14 @@ function M.render_browser()
   local where = cfg.host and ('%s:%s'):format(cfg.host, cfg.port or 10000) or 'hive (beeline)'
   add(' ', where, 'HiveHeader', {},
     S.job and (S.connected and '  ' .. ON .. ' connected' or '  ' .. OFF .. ' connecting' .. connecting()) or '  ' .. OFF .. ' not connected')
+  add('', '', nil)
+  -- The filter row: f (or <CR> here) opens the input box over it, see M.filter().
+  local fdb = B.filter.dbs
+  if fdb ~= '' then
+    add('  / ', fdb, 'HiveFilter', { kind = 'filter' })
+  else
+    add('  / ', 'filter (f)', 'HiveType', { kind = 'filter' })
+  end
   add('', '', nil)
   add('+ ', 'New query', 'HiveHelper', { kind = 'new' })
   local files = saved_queries()
@@ -1025,30 +1060,40 @@ function M.render_browser()
   if B.open['#dbs'] and not dbs then
     M.databases(render)
   end
-  add(arrow('#dbs'), 'Databases', 'HiveDb', { kind = 'node', key = '#dbs' }, dbs and ' (' .. #dbs .. ')' or nil)
+  local shown = dbs and filtered(dbs, fdb)
+  local count = dbs and (fdb ~= '' and (' (%d/%d)'):format(#shown, #dbs) or ' (' .. #dbs .. ')') or nil
+  add(arrow('#dbs'), 'Databases', 'HiveDb', { kind = 'node', key = '#dbs' }, count)
   if B.open['#dbs'] and not dbs then
-    add('    ', 'loading…', 'HiveType')
+    add('    ', 'loading\u{2026}', 'HiveType')
+  elseif B.open['#dbs'] and #shown == 0 and #dbs > 0 then
+    add('    ', '(no match)', 'HiveType')
   end
-  for _, db in ipairs(B.open['#dbs'] and dbs or {}) do
-    add('  ' .. arrow(db), db, 'HiveDb', { kind = 'node', key = db, db = db })
+  for _, db in ipairs(B.open['#dbs'] and shown or {}) do
+    local tf = B.filter.tables[db]
     local tables = B.open[db] and cache['tables:' .. db]
+    local tshown = tables and filtered(tables, tf)
+    add('  ' .. arrow(db), db, 'HiveDb', { kind = 'node', key = db, db = db },
+      tf and (tables and (' (%d/%d)'):format(#tshown, #tables) or '') .. '  / ' .. tf or nil)
+    -- The placeholder rows carry `db`, so f on them still filters this database's tables.
     if B.open[db] and not tables then
       M.tables(db, render)
-      add('      ', 'loading…', 'HiveType')
+      add('      ', 'loading\u{2026}', 'HiveType', { db = db })
     elseif tables and #tables == 0 then
-      add('      ', '(no tables)', 'HiveType')
+      add('      ', '(no tables)', 'HiveType', { db = db })
+    elseif tshown and #tshown == 0 then
+      add('      ', '(no match)', 'HiveType', { db = db })
     end
-    for _, tbl in ipairs(tables or {}) do
+    for _, tbl in ipairs(tshown or {}) do
       local key = db .. '.' .. tbl
       add('    ' .. arrow(key), tbl, 'HiveTable', { kind = 'node', key = key, db = db, tbl = tbl })
       if B.open[key] then
         for _, h in ipairs(HELPERS) do
-          add('        » ', h[1], 'HiveHelper', { kind = 'helper', helper = h, db = db, tbl = tbl })
+          add('        \u{00BB} ', h[1], 'HiveHelper', { kind = 'helper', helper = h, db = db, tbl = tbl })
         end
         local cols = cache['cols:' .. key]
         if not cols then
           M.columns(db, tbl, render)
-          add('        ', 'loading…', 'HiveType')
+          add('        ', 'loading\u{2026}', 'HiveType')
         end
         local w = 0
         for _, c in ipairs(cols or {}) do
@@ -1101,6 +1146,130 @@ local function browser_row()
   return B.rows[vim.fn.line('.')] or {}
 end
 
+---f in the browser: an input box over the filter row that narrows the tree as you type.
+---On a table, column or helper row (or the placeholder under an expanded database) it
+---filters that database's tables; anywhere else, the databases. Plain text, any case.
+---<CR> keeps it and moves to the first match, <Esc> puts back what was there before,
+---an empty box clears it.
+function M.filter()
+  local bwin = B.buf and vim.fn.bufwinid(B.buf) or -1
+  if bwin == -1 then
+    return
+  end
+  local r = browser_row()
+  local db = r.db and (r.tbl or r.kind == nil) and r.db or nil
+  local old = db and (B.filter.tables[db] or '') or B.filter.dbs
+  local function set(v)
+    v = vim.trim(v)
+    if db then
+      B.filter.tables[db] = v ~= '' and v or nil
+    else
+      B.filter.dbs = v
+      B.open['#dbs'] = true
+    end
+    M.render_browser()
+  end
+
+  -- The box sits over the filter row, so make sure that row is on screen.
+  vim.api.nvim_win_call(bwin, function()
+    vim.fn.winrestview({ topline = 1 })
+  end)
+  local prompt = require('lib.prompt')
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].bufhidden = 'wipe'
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { old })
+  local filter_row
+  for i, row in ipairs(B.rows) do
+    if row.kind == 'filter' then
+      filter_row = i
+      break
+    end
+  end
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = 'win',
+    win = bwin,
+    row = (filter_row or 3) - 2, -- topline is 1: the border's top on the line above the row
+    col = 0,
+    width = math.max(10, vim.api.nvim_win_get_width(bwin) - 2),
+    height = 1,
+    style = 'minimal',
+    border = prompt.border(),
+    title = db and (' Tables in %s '):format(db) or ' Filter databases ',
+    title_pos = 'left',
+    footer = ' <CR> keep  <Esc> undo ',
+    footer_pos = 'right',
+    zindex = 60,
+  })
+  vim.wo[win].winhighlight = prompt.winhighlight()
+  vim.api.nvim_win_set_cursor(win, { 1, #old })
+
+  local done = false
+  ---`keep` false puts the old filter back; `focus` moves to the first match.
+  local function close(keep, focus)
+    if done then
+      return
+    end
+    done = true
+    if not keep then
+      set(old)
+    end
+    pcall(vim.api.nvim_win_close, win, true)
+    if not (focus and vim.api.nvim_win_is_valid(bwin)) then
+      return
+    end
+    vim.api.nvim_set_current_win(bwin)
+    local target
+    for i, row in ipairs(B.rows) do
+      if db and row.kind == 'node' and row.db == db and row.tbl
+        or not db and row.kind == 'node' and row.db and not row.tbl then
+        target = i
+        break
+      end
+      if db and row.key == db then
+        target = target or i -- the database itself, when none of its tables match
+      end
+    end
+    if target then
+      vim.api.nvim_win_set_cursor(bwin, { target, 0 })
+    end
+  end
+  local function from_insert(fn)
+    return function()
+      vim.schedule(fn)
+      return '<Esc>'
+    end
+  end
+  local keep = function()
+    close(true, true)
+  end
+  local undo = function()
+    close(false, true)
+  end
+  vim.keymap.set('i', '<CR>', from_insert(keep), { buffer = buf, expr = true })
+  vim.keymap.set('n', '<CR>', keep, { buffer = buf, nowait = true })
+  for _, lhs in ipairs({ '<Esc>', '<C-c>' }) do
+    vim.keymap.set('i', lhs, from_insert(undo), { buffer = buf, expr = true })
+    vim.keymap.set('n', lhs, undo, { buffer = buf, nowait = true })
+  end
+  vim.api.nvim_create_autocmd({ 'TextChanged', 'TextChangedI' }, {
+    buffer = buf,
+    callback = function()
+      set(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or '')
+    end,
+  })
+  -- Clicking or jumping away keeps whatever was typed.
+  vim.api.nvim_create_autocmd('WinLeave', {
+    buffer = buf,
+    once = true,
+    callback = function()
+      vim.schedule(function()
+        close(true, false)
+      end)
+    end,
+  })
+  vim.cmd.startinsert({ bang = true })
+end
+
 function M.ddl(db, tbl)
   local fq = q(db) .. '.' .. q(tbl)
   request({ op = 'query', lane = 'meta', stmts = { 'SHOW CREATE TABLE ' .. fq }, limit = 100000 }, function(ev)
@@ -1146,89 +1315,35 @@ local function confirm_drop(db, tbl, info)
     or kind:find('EXTERNAL') and 'external: only the definition goes; the files stay'
     or kind:find('VIEW') and 'a view: no data is deleted'
     or 'could not be read; DROP may delete data'
-  local lines = {
-    '',
-    '  Database   ' .. db,
-    '  Table      ' .. tbl,
-    '  Type       ' .. kind,
-    '             ' .. effect,
-    '  Location   ' .. (info.location or 'unknown'),
-    '',
-    '  Runs       DROP TABLE ' .. fq,
-    '',
-  }
-  local width = 0
-  for _, l in ipairs(lines) do
-    width = math.max(width, vim.fn.strdisplaywidth(l) + 2)
-  end
-  width = math.min(math.max(width, 50), vim.o.columns - 4)
-  local height = #lines
-  local row = math.max(0, math.floor((vim.o.lines - height - 3) / 2) - 1)
-  local col = math.floor((vim.o.columns - width) / 2)
-
-  local ib = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_lines(ib, 0, -1, false, lines)
-  vim.bo[ib].modifiable, vim.bo[ib].bufhidden = false, 'wipe'
-  local iw = vim.api.nvim_open_win(ib, false, {
-    relative = 'editor', row = row, col = col, width = width, height = height,
-    style = 'minimal', border = 'rounded', title = ' Drop table ', title_pos = 'center',
-    focusable = false, zindex = 60,
+  require('lib.prompt').confirm({
+    title = 'Drop table',
+    danger = true,
+    type_to_confirm = tbl,
+    info = {
+      'Database   ' .. db,
+      'Table      ' .. tbl,
+      'Type       ' .. kind,
+      { '           ' .. effect, kind:find('EXTERNAL') and 'HiveType' or 'HiveError' },
+      'Location   ' .. (info.location or 'unknown'),
+      '',
+      'Runs       DROP TABLE ' .. fq,
+    },
+    on_cancel = function()
+      notify('drop cancelled', WARN)
+    end,
+    on_yes = function()
+      notify('dropping ' .. db .. '.' .. tbl .. '...')
+      request({ op = 'query', lane = 'meta', stmts = { 'DROP TABLE ' .. fq }, limit = 1 }, function(ev)
+        if ev.ev == 'error' then
+          return notify('DROP TABLE ' .. fq .. ': ' .. ev.msg, ERROR)
+        end
+        cache['tables:' .. db], cache['cols:' .. db .. '.' .. tbl] = nil, nil
+        B.open[db .. '.' .. tbl] = nil
+        M.render_browser()
+        notify('dropped ' .. db .. '.' .. tbl)
+      end)
+    end,
   })
-  vim.wo[iw].winhighlight = 'NormalFloat:Normal,FloatBorder:HiveError,FloatTitle:HiveError'
-  local hns = vim.api.nvim_create_namespace('hive-drop')
-  vim.api.nvim_buf_set_extmark(ib, hns, 4, 0, { end_col = #lines[5], hl_group = kind:find('EXTERNAL') and 'HiveType' or 'HiveError' })
-
-  local cb = vim.api.nvim_create_buf(false, true)
-  vim.bo[cb].bufhidden = 'wipe'
-  local cw = vim.api.nvim_open_win(cb, true, {
-    relative = 'editor', row = row + height + 2, col = col, width = width, height = 1,
-    style = 'minimal', border = 'rounded', zindex = 60,
-    title = (' type %s to drop it '):format(tbl), title_pos = 'left',
-    footer = ' <CR> confirm  <Esc> cancel ', footer_pos = 'right',
-  })
-  vim.wo[cw].winhighlight = 'NormalFloat:Normal,FloatBorder:HiveError,FloatTitle:HiveError,FloatFooter:HiveType'
-
-  local closed = false
-  local function close()
-    if closed then
-      return
-    end
-    closed = true
-    pcall(vim.api.nvim_win_close, cw, true)
-    pcall(vim.api.nvim_win_close, iw, true)
-  end
-  local function submit()
-    local typed = vim.trim(vim.api.nvim_buf_get_lines(cb, 0, 1, false)[1] or '')
-    close()
-    if typed ~= tbl then
-      return notify(typed == '' and 'drop cancelled' or ('drop cancelled: %q is not %q'):format(typed, tbl), WARN)
-    end
-    notify('dropping ' .. db .. '.' .. tbl .. '...')
-    request({ op = 'query', lane = 'meta', stmts = { 'DROP TABLE ' .. fq }, limit = 1 }, function(ev)
-      if ev.ev == 'error' then
-        return notify('DROP TABLE ' .. fq .. ': ' .. ev.msg, ERROR)
-      end
-      cache['tables:' .. db], cache['cols:' .. db .. '.' .. tbl] = nil, nil
-      B.open[db .. '.' .. tbl] = nil
-      M.render_browser()
-      notify('dropped ' .. db .. '.' .. tbl)
-    end)
-  end
-  -- Leave insert mode in the box before closing it, so the cursor in the browser stays put.
-  local function from_insert(fn)
-    return function()
-      vim.schedule(fn)
-      return '<Esc>'
-    end
-  end
-  vim.keymap.set('i', '<CR>', from_insert(submit), { buffer = cb, expr = true })
-  vim.keymap.set('i', '<Esc>', from_insert(close), { buffer = cb, expr = true })
-  vim.keymap.set('i', '<C-c>', from_insert(close), { buffer = cb, expr = true })
-  vim.keymap.set('n', '<CR>', submit, { buffer = cb, nowait = true })
-  vim.keymap.set('n', '<Esc>', close, { buffer = cb, nowait = true })
-  vim.keymap.set('n', 'q', close, { buffer = cb, nowait = true })
-  vim.api.nvim_create_autocmd('WinLeave', { buffer = cb, once = true, callback = close })
-  vim.cmd.startinsert()
 end
 
 ---:HiveDropTable -- the table under the cursor in the browser, after confirmation.
@@ -1281,6 +1396,8 @@ local function browser_buf()
       M.render_browser()
     elseif r.kind == 'new' then
       M.new_query()
+    elseif r.kind == 'filter' then
+      M.filter()
     elseif r.kind == 'file' then
       open_in_editor(r.path)
     elseif r.kind == 'helper' then
@@ -1322,10 +1439,29 @@ local function browser_buf()
   end, 'Insert the name in the editor')
   map('D', function()
     local r = browser_row()
-    if r.kind == 'file' and vim.fn.confirm('Delete ' .. vim.fn.fnamemodify(r.path, ':t') .. '?', '&Yes\n&No', 2) == 1 then
-      vim.fn.delete(r.path)
-      M.render_browser()
+    if r.kind ~= 'file' then
+      return
     end
+    local info = {
+      'File       ' .. vim.fn.fnamemodify(r.path, ':t'),
+      'Folder     ' .. vim.fn.fnamemodify(r.path, ':~:h'),
+      'Modified   ' .. os.date('%Y-%m-%d %H:%M', vim.fn.getftime(r.path)),
+      '',
+    }
+    local body = vim.fn.readfile(r.path, '', 6)
+    for i, l in ipairs(body) do
+      info[#info + 1] = { (i == 6 and '...' or l), 'Comment' }
+    end
+    require('lib.prompt').confirm({
+      title = 'Delete saved query',
+      danger = true,
+      info = info,
+      on_yes = function()
+        vim.fn.delete(r.path)
+        M.render_browser()
+        notify('deleted ' .. vim.fn.fnamemodify(r.path, ':t'))
+      end,
+    })
   end, 'Delete a saved query')
   map('R', function()
     local r = browser_row()
@@ -1339,6 +1475,11 @@ local function browser_buf()
     M.render_browser()
   end, 'Reload this node')
   map('C', M.connect, 'Reconnect')
+  map('f', M.filter, 'Filter databases, or the tables of the database under the cursor')
+  map('F', function()
+    B.filter = { dbs = '', tables = {} }
+    M.render_browser()
+  end, 'Clear all filters')
   map('<Tab>', function()
     M.cycle(1)
   end, 'Next pane')
@@ -1361,7 +1502,7 @@ local function browser_window(win)
   local wo = vim.wo[win]
   wo.number, wo.relativenumber, wo.wrap, wo.list, wo.spell = false, false, false, false, false
   wo.cursorline, wo.signcolumn, wo.winfixwidth = true, 'no', true
-  wo.winbar = ' [1] %#HiveHeader#Hive%*  <CR> open/run  e edit  i insert  R reload'
+  wo.winbar = ' [1] %#HiveHeader#Hive%*  <CR> open/run  e edit  i insert  f filter  R reload'
   B.open['#dbs'] = B.open['#dbs'] ~= false
   M.render_browser()
 end
@@ -1505,6 +1646,7 @@ function M.reveal()
   end
   local key = tbl and db ~= tbl and (db .. '.' .. tbl) or db
   B.open['#dbs'], B.open[db] = true, true
+  B.filter.dbs, B.filter.tables[db] = '', nil -- so the filter can't hide what was asked for
   if key ~= db then
     B.open[key] = true
   end

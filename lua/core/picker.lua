@@ -803,11 +803,12 @@ local function prompt_dir(label, cb)
 	-- :. cannot shorten the cwd itself (it yields the full path), so special-case it. The
 	-- trailing slash lets <Tab> complete straight into subdirectories.
 	local default = bufdir == vim.fn.getcwd() and "./" or vim.fn.fnamemodify(bufdir, ":~:.") .. "/"
-	vim.ui.input({ prompt = label .. " in dir: ", default = default, completion = "dir" }, function(input)
-		input = vim.trim(input or "")
-		if input == "" then
-			return
-		end
+	require("lib.prompt").input({
+		title = label .. " in a directory",
+		box_title = "directory",
+		default = default,
+		complete = "dir",
+		on_submit = function(input)
 		local dir = vim.fs.normalize(vim.fn.fnamemodify(vim.fn.expand(input), ":p"))
 		-- :p leaves a trailing slash on directories; strip it so the corpus cache key and
 		-- the BufWritePost prefix match the way root() spells paths.
@@ -817,7 +818,8 @@ local function prompt_dir(label, cb)
 			return
 		end
 		cb(dir)
-	end)
+		end,
+	})
 end
 
 ---@param dir? string defaults to the project root

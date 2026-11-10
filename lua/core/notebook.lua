@@ -1041,13 +1041,14 @@ local function popup(lines, title, footer)
     width = width,
     height = height,
     style = 'minimal',
-    border = BORDER,
+    border = require('lib.prompt').border(),
     title = title,
     title_pos = 'center',
     footer = footer,
     footer_pos = 'right',
   })
-  vim.wo[win].winhighlight = 'NormalFloat:Normal,FloatBorder:NotebookBorderActive,FloatTitle:NotebookLabel,FloatFooter:NotebookStatus'
+  -- The same look as the dialogs in lib.prompt: theme colours on the editor background.
+  vim.wo[win].winhighlight = require('lib.prompt').winhighlight()
   vim.wo[win].wrap = false
   vim.wo[win].cursorline = true
   vim.api.nvim_create_autocmd('WinLeave', {

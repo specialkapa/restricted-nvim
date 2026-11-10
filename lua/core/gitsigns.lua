@@ -34,7 +34,7 @@ local SIGNS = {
   change = { '~', 'GitSignsChange' },
   changedelete = { '~', 'GitSignsChange' },
   delete = { '_', 'GitSignsDelete' },
-  topdelete = { '‾', 'GitSignsDelete' },
+  topdelete = { '\u{203E}', 'GitSignsDelete' },
 }
 
 local enabled = true

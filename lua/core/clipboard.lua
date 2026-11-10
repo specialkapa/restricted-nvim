@@ -54,17 +54,26 @@ local function setup()
   -- SSH. Paste is left to Neovim's registers because most terminals refuse OSC 52 reads.
   local ok, osc52 = pcall(require, 'vim.ui.clipboard.osc52')
   if ok then
+    -- Since the terminal can't be read back, + and * remember what was last copied into
+    -- them. Falling back to `"` here was wrong: setreg('+', x) points `p` at +, and +
+    -- then answered with `"`, which still held the PREVIOUS yank.
+    local last = {}
+    local function copy(reg)
+      local send = osc52.copy(reg)
+      return function(lines, regtype)
+        last[reg] = { lines, regtype }
+        send(lines, regtype)
+      end
+    end
+    local function paste(reg)
+      return function()
+        return last[reg] or vim.split(vim.fn.getreg('0'), '\n')
+      end
+    end
     vim.g.clipboard = {
       name = 'OSC 52',
-      copy = { ['+'] = osc52.copy('+'), ['*'] = osc52.copy('*') },
-      paste = {
-        ['+'] = function()
-          return vim.split(vim.fn.getreg('"'), '\n')
-        end,
-        ['*'] = function()
-          return vim.split(vim.fn.getreg('"'), '\n')
-        end,
-      },
+      copy = { ['+'] = copy('+'), ['*'] = copy('*') },
+      paste = { ['+'] = paste('+'), ['*'] = paste('*') },
     }
     return 'OSC 52 (copy only)'
   end

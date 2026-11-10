@@ -515,7 +515,7 @@ local function confirm(title, edits, on_yes)
     border = 'single',
     title = title,
     title_pos = 'center',
-    footer = ' y apply · q cancel ',
+    footer = ' y apply \u{00B7} q cancel ',
     footer_pos = 'right',
   })
   vim.wo[win].wrap = false
@@ -638,11 +638,20 @@ function M.rename_current(arg)
   if arg and arg ~= '' then
     return M.move(src, target(src, arg))
   end
-  vim.ui.input({ prompt = 'Move to: ', default = rel(src), completion = 'file' }, function(input)
-    if input and input ~= '' then
+  require('lib.prompt').input({
+    title = 'Move / rename',
+    info = {
+      'From       ' .. rel(src),
+      '',
+      'Python imports of it are updated; you see every edit before it happens.',
+    },
+    box_title = 'to',
+    default = rel(src),
+    complete = 'file',
+    on_submit = function(input)
       M.move(src, target(src, input))
-    end
-  end)
+    end,
+  })
 end
 
 ---netrw's R, routed through M.move. Marked files (mf) still go to netrw's own rename.
@@ -657,17 +666,26 @@ local function netrw_rename()
   end
   -- The same path netrw's own rename works out for the entry under the cursor.
   local src = vim.fn['netrw#Call']('ComposePath', vim.b.netrw_curdir, word):gsub('/+$', '')
-  local input = vim.fn.input('Move to: ', rel(src), 'file')
-  if input == '' then
-    return
-  end
   local view = vim.fn.winsaveview()
-  M.move(src, vim.fn.fnamemodify(input, ':p'), function()
-    pcall(function()
-      vim.fn['netrw#Call']('NetrwRefresh', 1, vim.fn['netrw#Call']('NetrwBrowseChgDir', 1, './', 0))
-      vim.fn.winrestview(view)
-    end)
-  end)
+  require('lib.prompt').input({
+    title = 'Move / rename',
+    info = {
+      'From       ' .. rel(src),
+      '',
+      'Python imports of it are updated; you see every edit before it happens.',
+    },
+    box_title = 'to',
+    default = rel(src),
+    complete = 'file',
+    on_submit = function(input)
+      M.move(src, vim.fn.fnamemodify(input, ':p'), function()
+        pcall(function()
+          vim.fn['netrw#Call']('NetrwRefresh', 1, vim.fn['netrw#Call']('NetrwBrowseChgDir', 1, './', 0))
+          vim.fn.winrestview(view)
+        end)
+      end)
+    end,
+  })
 end
 
 vim.api.nvim_create_user_command('Rename', function(cmd)

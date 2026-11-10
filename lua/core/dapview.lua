@@ -11,6 +11,7 @@
 -- variable, y yanks a value, q closes. In the REPL, <Up>/<Down> walk the history.
 
 local dap = require 'core.dap'
+local prompt = require 'lib.prompt'
 local spinner = require 'lib.spinner'
 
 local M = {}
@@ -135,7 +136,7 @@ local function add_tree(b, node, depth)
   local open = V.expanded[node.key]
   local indent = string.rep('  ', depth)
   local chunks = {
-    { indent .. (node.ref > 0 and (open and '▾ ' or '▸ ') or '  ') },
+    { indent .. (node.ref > 0 and (open and '\u{25BE} ' or '\u{25B8} ') or '  ') },
     { node.name, node.scope and 'Title' or 'Identifier' },
   }
   if node.type and node.type ~= '' then
@@ -581,23 +582,35 @@ local function change_watch(node)
   if not w then
     return
   end
-  vim.ui.input({ prompt = 'Watch: ', default = w.expr }, function(expr)
-    if expr and vim.trim(expr) ~= '' then
-      w.expr = vim.trim(expr)
+  local n = w.node or {}
+  prompt.input({
+    title = 'Change watch',
+    info = { 'Watch      ' .. w.expr, 'Value      ' .. tostring(n.value or '(not evaluated: not stopped)') },
+    box_title = 'new expression',
+    default = w.expr,
+    on_submit = function(expr)
+      w.expr = expr
       eval_watch(w)
       redraw()
-    end
-  end)
+    end,
+  })
 end
 
 local function set_value(node)
   if not node or not node.parent_ref then
     return
   end
-  vim.ui.input({ prompt = node.name .. ' = ', default = node.value }, function(value)
-    if not value or value == '' then
-      return
-    end
+  local value = tostring(node.value or '')
+  prompt.input({
+    title = 'Set variable',
+    info = {
+      'Variable   ' .. node.name,
+      'Type       ' .. (node.type or 'unknown'),
+      'Current    ' .. (#value > 80 and value:sub(1, 77) .. '...' or value),
+    },
+    box_title = node.name .. ' = (a Python expression)',
+    default = value,
+    on_submit = function(value)
     dap.set_variable(node.parent_ref, node.name, value, function(err, body)
       if err then
         return vim.notify(err, WARN)
@@ -609,7 +622,8 @@ local function set_value(node)
       end
       redraw()
     end)
-  end)
+    end,
+  })
 end
 
 view_buf = function()
@@ -633,11 +647,12 @@ view_buf = function()
   map('c', change_watch)
   map('s', set_value)
   map('a', function()
-    vim.ui.input({ prompt = 'Watch: ' }, function(expr)
-      if expr then
-        M.add_watch(expr)
-      end
-    end)
+    prompt.input({
+      title = 'Add watch',
+      info = { 'An expression, evaluated in the selected frame at every stop.' },
+      box_title = 'expression',
+      on_submit = M.add_watch,
+    })
   end)
   map('y', function(node)
     if node and node.value then
@@ -667,7 +682,7 @@ local function render_hover()
   add_tree(b, h.root, 0)
   flush(h.buf, b)
   h.nodes = b.nodes
-  local width = 20
+  local width = math.max(20, vim.fn.strdisplaywidth(h.title) + 4, vim.fn.strdisplaywidth(h.footer) + 4)
   for _, l in ipairs(b.lines) do
     width = math.max(width, vim.fn.strdisplaywidth(l) + 1)
   end
@@ -694,21 +709,45 @@ function M.hover()
     local root = { key = 'hover:' .. expr, name = expr, value = body.result, type = body.type, ref = body.variablesReference or 0 }
     local buf = vim.api.nvim_create_buf(false, true)
     vim.bo[buf].bufhidden = 'wipe'
+    local short = #expr > 40 and expr:sub(1, 37) .. '...' or expr
+    local title = ' ' .. short .. (body.type and (' \u{00B7} ' .. body.type) or '') .. ' '
+    local footer = (root.ref > 0 and ' <CR> expand ' or ' ') .. ' y yank  w watch  q close '
     local win = vim.api.nvim_open_win(buf, false, {
       relative = 'cursor',
       row = 1,
       col = 0,
       width = 20,
       height = 1,
-      border = 'rounded',
+      border = prompt.border(),
       style = 'minimal',
+      title = title,
+      title_pos = 'left',
+      footer = footer,
+      footer_pos = 'right',
     })
-    V.hover = { win = win, buf = buf, root = root, nodes = {} }
+    vim.wo[win].winhighlight = prompt.winhighlight()
+    V.hover = { win = win, buf = buf, root = root, nodes = {}, title = title, footer = footer }
+    local function node()
+      return V.hover and V.hover.nodes[vim.api.nvim_win_get_cursor(0)[1]]
+    end
     for _, lhs in ipairs { '<CR>', '<Tab>' } do
       vim.keymap.set('n', lhs, function()
-        toggle_node(V.hover.nodes[vim.api.nvim_win_get_cursor(0)[1]])
+        toggle_node(node())
       end, { buffer = buf, nowait = true })
     end
+    -- y: the value on this line into the register; w: watch the hovered expression.
+    vim.keymap.set('n', 'y', function()
+      local n = node()
+      if n and n.value then
+        vim.fn.setreg(vim.v.register, n.value)
+        vim.notify('yanked ' .. n.name)
+      end
+    end, { buffer = buf, nowait = true })
+    vim.keymap.set('n', 'w', function()
+      M.add_watch(expr)
+      close_hover()
+      vim.notify('watching ' .. expr)
+    end, { buffer = buf, nowait = true })
     for _, lhs in ipairs { 'q', '<Esc>' } do
       vim.keymap.set('n', lhs, close_hover, { buffer = buf, nowait = true })
     end

@@ -130,18 +130,50 @@ vim.api.nvim_create_user_command('SnippetAdd', function(args)
       return
     end
     local path = snippet_file(ft, word)
-    if vim.fn.filereadable(path) == 1 and vim.fn.confirm(word .. ' exists for ' .. ft .. '. Overwrite?', '&Yes\n&No', 2) ~= 1 then
-      return
+    local body = to_body(lines)
+    local function write()
+      vim.fn.mkdir(vim.fs.dirname(path), 'p')
+      vim.fn.writefile(body, path)
+      vim.cmd('split ' .. vim.fn.fnameescape(path))
+      vim.notify('Snippet ' .. word .. ' saved for ' .. ft)
     end
-    vim.fn.mkdir(vim.fs.dirname(path), 'p')
-    vim.fn.writefile(to_body(lines), path)
-    vim.cmd('split ' .. vim.fn.fnameescape(path))
-    vim.notify('Snippet ' .. word .. ' saved for ' .. ft)
+    if vim.fn.filereadable(path) == 0 then
+      return write()
+    end
+    -- Exists already: show the old body against the new one before replacing it.
+    local info = { 'Trigger    ' .. word .. '   (' .. ft .. ')', 'File       ' .. vim.fn.fnamemodify(path, ':~'), '', 'Current' }
+    local function add(src, hl)
+      for i, l in ipairs(src) do
+        if i > 5 then
+          info[#info + 1] = { ('  ... %d more lines'):format(#src - 5), 'Comment' }
+          break
+        end
+        info[#info + 1] = { '  ' .. l:gsub('\t', '  '), hl }
+      end
+    end
+    add(vim.fn.readfile(path), 'DiffDelete')
+    info[#info + 1] = ''
+    info[#info + 1] = 'New'
+    add(body, 'DiffAdd')
+    require('lib.prompt').confirm({ title = 'Overwrite snippet', info = info, on_yes = write })
   end
   if args.args ~= '' then
     save(args.args)
   else
-    vim.ui.input({ prompt = 'Snippet trigger: ' }, save)
+    local info = { 'Filetype   ' .. ft, '' }
+    for i, l in ipairs(lines) do
+      if i > 6 then
+        info[#info + 1] = { ('  ... %d more lines'):format(#lines - 6), 'Comment' }
+        break
+      end
+      info[#info + 1] = { '  ' .. l:gsub('\t', '  '), 'Comment' }
+    end
+    require('lib.prompt').input({
+      title = 'New snippet',
+      info = info,
+      box_title = 'trigger word (letters, digits, _)',
+      on_submit = save,
+    })
   end
 end, { range = true, nargs = '?', desc = 'Save the selected lines as a snippet' })
 

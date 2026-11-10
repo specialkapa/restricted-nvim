@@ -86,7 +86,7 @@ local function style(win)
   -- would inherit it. pcall: winbar needs Neovim 0.8+.
   pcall(function()
     local fc = vim.o.fillchars
-    fc = (fc == '' and '' or fc .. ',') .. 'wbr:─'
+    fc = (fc == '' and '' or fc .. ',') .. 'wbr:\u{2500}'
     vim.api.nvim_set_option_value('fillchars', fc, { scope = 'local', win = win })
     vim.api.nvim_set_option_value('winbar', '%#TermSeparator#%=', { scope = 'local', win = win })
   end)

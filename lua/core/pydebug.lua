@@ -356,11 +356,18 @@ vim.keymap.set("n", "<leader>b", function()
 end, { desc = "Debug: Toggle [B]reakpoint" })
 
 vim.keymap.set("n", "<leader>B", function()
-	vim.ui.input({ prompt = "Breakpoint condition: " }, function(cond)
-		if cond and cond ~= "" then
-			toggle_breakpoint(cond)
-		end
-	end)
+	local code = vim.trim(vim.api.nvim_get_current_line())
+	require("lib.prompt").input({
+		title = "Conditional breakpoint",
+		info = {
+			"At         " .. vim.fn.expand("%:~:.") .. ":" .. vim.fn.line("."),
+			{ "Code       " .. (#code > 70 and code:sub(1, 67) .. "..." or code), "Comment" },
+			"",
+			"Stops only when this Python expression is true.",
+		},
+		box_title = "condition",
+		on_submit = toggle_breakpoint,
+	})
 end, { desc = "Debug: Conditional [B]reakpoint" })
 
 vim.keymap.set("n", "<leader>bb", browse_breakpoints, { desc = "Debug: [B]rowse [B]reakpoints" })

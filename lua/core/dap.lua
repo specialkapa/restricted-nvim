@@ -989,19 +989,41 @@ end, { desc = '[D]ebug: Toggle the [V]iew panel' })
 map('n', '<leader>b', function()
   M.toggle_breakpoint()
 end, { desc = 'Debug: Toggle [B]reakpoint' })
+---Where a breakpoint would go: `file:line` and that line's code, for the prompt.
+local function here()
+  local name = vim.fn.expand('%:~:.')
+  local code = vim.trim(vim.api.nvim_get_current_line())
+  return {
+    'At         ' .. name .. ':' .. vim.fn.line('.'),
+    { 'Code       ' .. (#code > 70 and code:sub(1, 67) .. '...' or code), 'Comment' },
+  }
+end
+
 map('n', '<leader>B', function()
-  vim.ui.input({ prompt = 'Breakpoint condition: ' }, function(c)
-    if c and c ~= '' then
+  local info = here()
+  info[#info + 1] = ''
+  info[#info + 1] = 'Stops only when this Python expression is true.'
+  require('lib.prompt').input({
+    title = 'Conditional breakpoint',
+    info = info,
+    box_title = 'condition',
+    on_submit = function(c)
       M.toggle_breakpoint { condition = c }
-    end
-  end)
+    end,
+  })
 end, { desc = 'Debug: Conditional [B]reakpoint' })
 map('n', '<leader>bl', function()
-  vim.ui.input({ prompt = 'Log message ({expr} is interpolated): ' }, function(m)
-    if m and m ~= '' then
+  local info = here()
+  info[#info + 1] = ''
+  info[#info + 1] = 'Printed instead of stopping; {expr} is replaced by its value.'
+  require('lib.prompt').input({
+    title = 'Log point',
+    info = info,
+    box_title = 'message',
+    on_submit = function(m)
       M.toggle_breakpoint { logMessage = m }
-    end
-  end)
+    end,
+  })
 end, { desc = 'Debug: [L]og point' })
 map('n', '<leader>bb', browse_breakpoints, { desc = 'Debug: [B]rowse [B]reakpoints' })
 map('n', '<leader>bi', insert_breakpoint_call, { desc = 'Debug: [I]nsert breakpoint() call' })

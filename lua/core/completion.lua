@@ -14,13 +14,13 @@ local has_native = vim.lsp.completion ~= nil and vim.lsp.completion.enable ~= ni
 -- noinsert (NOT noselect): the first entry is preselected but nothing is written into
 -- the buffer until you confirm -- which is what makes a bare <C-y> always have something
 -- to accept, exactly like cmp.confirm { select = true }.
-local opts = { 'menu', 'menuone', 'noinsert' }
-if has_native then
-  -- No cmp equivalents -- cmp draws its own windows and does its own matching.
-  -- popup: documentation in a floating window. fuzzy: subsequence matching.
-  vim.list_extend(opts, { 'popup', 'fuzzy' })
-end
-vim.opt.completeopt = opts
+--
+-- Deliberately NOT 'fuzzy' or 'popup'. ty answers each request with thousands of items.
+-- With 'fuzzy', vim.lsp.completion calls vim.fn.matchfuzzy() once per item on the main
+-- thread; with 'popup', moving through the menu sends a completionItem/resolve for every
+-- entry. Together they made typing stall on the VDI (0.11.4); removing both fixed it.
+-- Docs for the selected item are still available after accepting, via K.
+vim.opt.completeopt = { 'menu', 'menuone', 'noinsert' }
 
 vim.opt.pumheight = 12
 vim.opt.shortmess:append 'c' -- silence "match 1 of 12" spam
@@ -101,7 +101,7 @@ end
 -- request at all until you stop. It fires at most once per word: if the menu closes
 -- because nothing matches, it stays closed (<C-Space> asks again). Each request makes
 -- the server send its whole list -- thousands of items with ty -- and Neovim converts
--- and fuzzy-matches all of them on the main thread, so asking once per word matters.
+-- and filters all of them on the main thread, so asking once per word matters.
 -- After a `/` ending a path that starts `/`, `./`, `../` or `~/` it opens <C-x><C-f>
 -- (file names, relative to the cwd) in any buffer, LSP or not.
 --
